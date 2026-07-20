@@ -97,6 +97,14 @@ impl AlbumBuffer {
     pub fn pending_groups(&self) -> usize {
         self.groups.len()
     }
+
+    /// Drain every buffered group, returning each as its own batch.
+    ///
+    /// Used on shutdown to force-flush albums still inside their quiet window so
+    /// they are delivered rather than dropped. Leaves the buffer empty.
+    pub fn flush_all(&mut self) -> Vec<Vec<MediaItem>> {
+        self.groups.drain().map(|(_, (items, _))| items).collect()
+    }
 }
 
 #[cfg(test)]
@@ -157,6 +165,25 @@ mod tests {
         tokio::time::advance(Duration::from_millis(400)).await;
         let out = b.tick().await;
         assert_eq!(out.map(|v| v.len()), Some(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn flush_all_returns_all_buffered_groups() {
+        let mut b = AlbumBuffer::new(Duration::from_secs(1));
+        // Two grouped items in one album, plus a second album — none past window.
+        assert!(b.push(fake_item(Some(1), 1)).await.is_none());
+        assert!(b.push(fake_item(Some(1), 2)).await.is_none());
+        assert!(b.push(fake_item(Some(2), 3)).await.is_none());
+        assert_eq!(b.pending_groups(), 2);
+
+        let mut batches = b.flush_all();
+        batches.sort_by_key(|batch| batch.len());
+        assert_eq!(batches.len(), 2);
+        // One group has 2 items, the other has 1.
+        assert_eq!(batches[0].len(), 1);
+        assert_eq!(batches[1].len(), 2);
+        // Buffer is now empty.
+        assert_eq!(b.pending_groups(), 0);
     }
 
     #[tokio::test(start_paused = true)]

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{anyhow, Context};
 use arc_swap::ArcSwap;
 use clap::Parser;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -42,6 +42,8 @@ const RELOAD_TICK: Duration = Duration::from_secs(5);
 const ALBUM_WINDOW: Duration = Duration::from_secs(1);
 /// Dedup LRU capacity.
 const DEDUP_CAP: usize = 8192;
+/// Capacity of the channel carrying downloaded media items back to the loop.
+const MEDIA_CHANNEL_CAP: usize = 64;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -300,6 +302,10 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
     let mut dedup = Dedup::new(DEDUP_CAP);
     let mut album = AlbumBuffer::new(ALBUM_WINDOW);
 
+    // Downloads run on spawned tasks and hand finished items back to the loop
+    // over this channel; `album` stays single-owned by the loop.
+    let (media_tx, mut media_rx) = mpsc::channel::<MediaItem>(MEDIA_CHANNEL_CAP);
+
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut media_tick = tokio::time::interval(MEDIA_TICK);
@@ -322,10 +328,20 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
                     Ok(u) => {
                         handle_update(
                             u, &conn.client, &live, &deliverer, &ops,
-                            &mut dedup, &mut album,
+                            &mut dedup, &media_tx,
                         ).await;
                     }
                     Err(e) => warn!(error = %e, "update stream error"),
+                }
+            }
+
+            // A download task finished: push the ready item into the album
+            // buffer. The buffer stays single-owned by this loop.
+            Some(item) = media_rx.recv() => {
+                if let Some(batch) = album.push(item).await {
+                    let d = deliverer.clone();
+                    let ops = ops.clone();
+                    tokio::spawn(async move { flush_album(&d, &ops, batch).await; });
                 }
             }
 
@@ -353,6 +369,13 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
 
     info!("shutting down");
     ops.notice("relay shutting down").await;
+
+    // Force-flush any albums still inside their quiet window so they are
+    // delivered rather than dropped on shutdown.
+    for batch in album.flush_all() {
+        flush_album(&deliverer, &ops, batch).await;
+    }
+
     let _ = updates.sync_update_state().await;
     conn.handle.quit();
     let _ = conn.pool_task.await;
@@ -394,7 +417,7 @@ async fn handle_update(
     deliverer: &Arc<Deliverer>,
     ops: &Ops,
     dedup: &mut Dedup,
-    album: &mut AlbumBuffer,
+    media_tx: &mpsc::Sender<MediaItem>,
 ) {
     let Some(incoming) = telegram::classify(update) else {
         return;
@@ -510,44 +533,59 @@ async fn handle_update(
                 return;
             }
 
-            // Download bytes in-memory, then push into the album buffer.
-            let bytes = match download_media(client, &media).await {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(error = %e, msg_id, "media download failed");
-                    ops.drop_notice(&format!("media download failed (msg {msg_id}): {e}"))
-                        .await;
-                    return;
-                }
-            };
-            let filename = media_filename(&media, msg_id);
+            // Precompute owned routing data (username + targets) per matching
+            // route so the download task needs nothing borrowed from the loop.
+            let route_items: Vec<(String, Vec<WebhookUrl>)> = wanted
+                .into_iter()
+                .map(|(route, targets)| (display_name(sender.as_deref(), &route.name), targets))
+                .collect();
 
-            // One MediaItem per matching route (each carries its own targets),
-            // but only the first route's item keeps the caption to avoid dupes.
-            for (i, (route, targets)) in wanted.into_iter().enumerate() {
-                let username = display_name(sender.as_deref(), &route.name);
-                let item = MediaItem {
-                    grouped_id,
-                    msg_id,
-                    chat,
-                    username,
-                    filename: filename.clone(),
-                    bytes: bytes.clone(),
-                    caption: if i == 0 {
-                        caption.clone()
-                    } else {
-                        String::new()
-                    },
-                    targets,
+            // Move the download OFF the hot path: spawn a task that downloads,
+            // builds one MediaItem per route, and hands each back over the
+            // channel. handle_update never awaits the download, so text
+            // delivery, timers, and shutdown are never blocked by it.
+            let client = client.clone();
+            let media_tx = media_tx.clone();
+            let ops = ops.clone();
+            tokio::spawn(async move {
+                let bytes = match download_media(&client, &media).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!(error = %e, msg_id, "media download failed");
+                        ops.drop_notice(&format!("media download failed (msg {msg_id}): {e}"))
+                            .await;
+                        return;
+                    }
                 };
-                if let Some(batch) = album.push(item).await {
-                    let d = deliverer.clone();
-                    let ops = ops.clone();
-                    tokio::spawn(async move {
-                        flush_album(&d, &ops, batch).await;
-                    });
+                let filename = media_filename(&media, msg_id);
+
+                // One MediaItem per matching route (each carries its own
+                // targets); only the first route's item keeps the caption to
+                // avoid duplicate caption posts across fan-out.
+                for (i, (username, targets)) in route_items.into_iter().enumerate() {
+                    let item = MediaItem {
+                        grouped_id,
+                        msg_id,
+                        chat,
+                        username,
+                        filename: filename.clone(),
+                        bytes: bytes.clone(),
+                        caption: if i == 0 {
+                            caption.clone()
+                        } else {
+                            String::new()
+                        },
+                        targets,
+                    };
+                    // Never block the download task on a full channel: on
+                    // full/closed, log and post a rate-limited ops drop notice.
+                    if let Err(e) = media_tx.try_send(item) {
+                        warn!(error = %e, msg_id, "media channel send failed; dropping item");
+                        ops.drop_notice(&format!("media dropped (msg {msg_id}): channel {e}"))
+                            .await;
+                    }
                 }
-            }
+            });
         }
     }
 }
