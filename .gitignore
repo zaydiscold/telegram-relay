@@ -1,0 +1,5 @@
+/target
+.env
+*.session
+config.yaml
+relay.db*
