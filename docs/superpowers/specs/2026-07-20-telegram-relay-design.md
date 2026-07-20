@@ -150,9 +150,33 @@ Not enforced: no dogmatic combinator towers; readability wins.
 - New-IP session use will trigger a Telegram "new login" notification once —
   expected, it's the session moving to mothership.
 
+## Message store & refresh worker (v1)
+
+SQLite (`rusqlite`, WAL mode) file `relay.db` beside the session maps every
+relayed post: `(chat_id, tg_msg_id) → (discord_msg_id, route, webhook,
+content_hash, reactions, comment_count, deleted, timestamps)`. The
+`discord_msg_id` comes free from the `?wait=true` webhook response.
+
+A background refresh worker (default every 30 min, rows younger than 48 h)
+batch-fetches watched posts from Telegram (≤100 ids per request per chat),
+diffs, and PATCHes the Discord embed in place:
+
+- reaction counts + comment count line updated
+- edits → body refreshed with `(edited)` marker
+- deletes → body struck through + `🗑 deleted on Telegram` note
+
+Rows past the horizon are pruned. The worker never touches the hot path.
+
+## Rendering (embed form)
+
+Posts render as a Discord embed: channel-branded author line + avatar,
+body, reactions/comments line, `↗ View on Telegram` link (t.me deep-link),
+and footer `by zayd — <variant>` where `<variant>` is picked per-message
+from a small built-in list of "let's get this bag" variations.
+
 ## Non-goals (v1)
 
-- Discord → Telegram direction. Edit-in-place. Multi-account. Web UI.
+- Discord → Telegram direction. Multi-account. Web UI.
   Translation/AI anything. Bot-API mode.
 
 ## Consent & scope

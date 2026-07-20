@@ -907,6 +907,42 @@ Expected: all green; `chats` lists dialogs; `check` exit 0.
 
 - [ ] **Step 5: Commit** — `git commit -am "Add CLI, media lane with album coalescing, main wiring, ops notices"`
 
+### Task 7b: store module + refresh worker + embed rendering
+
+**Files:**
+- Create: `src/store.rs`, `src/refresh.rs`
+- Modify: `src/render.rs` (embed builder + footer), `src/deliver.rs` (capture `discord_msg_id` from `?wait=true` JSON; add `patch_embed`), `src/main.rs` (spawn refresh task), `Cargo.toml` (`rusqlite = { version = "0.32", features = ["bundled"] }`, `rand = "0.8"`)
+- Test: inline (store CRUD against a temp-file DB; render embed snapshot tests; refresh diff logic with fake fetcher)
+
+**Interfaces:**
+- Produces:
+  - `Store::open(path: &Path) -> Result<Store>` — creates schema (WAL mode):
+    ```sql
+    CREATE TABLE IF NOT EXISTS relayed (
+      chat_id INTEGER NOT NULL, tg_msg_id INTEGER NOT NULL,
+      route TEXT NOT NULL, webhook_name TEXT NOT NULL,
+      discord_msg_id TEXT NOT NULL,
+      posted_at INTEGER NOT NULL, last_checked INTEGER NOT NULL,
+      content_hash TEXT NOT NULL,
+      reactions TEXT NOT NULL DEFAULT '{}',
+      comment_count INTEGER NOT NULL DEFAULT 0,
+      deleted INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (chat_id, tg_msg_id, discord_msg_id));
+    ```
+  - `Store::record(&self, rec: NewRecord)`, `Store::due(&self, horizon_hours: u64) -> Vec<TrackedMsg>`, `Store::update_stats(&self, ...)`, `Store::mark_deleted(&self, ...)`, `Store::prune(&self, horizon_hours: u64)`
+  - `render::embed(post: &RelayText, meta: &EmbedMeta) -> serde_json::Value` — Discord embed JSON: author = channel title + avatar url, description = body (split across multiple embeds if > 4096), fields line `❤️ 47 · 🔥 12 · 💬 8`, `↗ View on Telegram` masked link, footer `by zayd — {variant}` with `variant = FOOTERS[rand::random_range(0..FOOTERS.len())]`; `FOOTERS: &[&str]` ~15 "let's get this bag" variations.
+  - `deliver::post_embed(...) -> PostResult { Delivered { discord_msg_id: String }, Dropped { reason } }` (parse `id` from `?wait=true` response body)
+  - `deliver::patch_embed(&self, url: &WebhookUrl, discord_msg_id: &str, embed: serde_json::Value) -> Outcome` — `PATCH {webhook}/messages/{id}`
+  - `refresh::run(client, store, deliverer, cfg)` — `tokio::time::interval(cfg.refresh.interval_mins * 60s)`; per chat: batch `client.get_messages_by_id` (≤100 ids); missing → `mark_deleted` + PATCH strikethrough `🗑 deleted on Telegram`; hash change → PATCH `(edited)` body; reactions/comment-count change → PATCH stats line; update `last_checked`; then `prune`.
+- Config additions (`config.example.yaml`): `refresh: { interval_mins: 30, horizon_hours: 48 }`; `store: { path: relay.db }`.
+
+- [ ] **Step 1: failing store tests** (record → due → update → prune roundtrip on tempfile DB)
+- [ ] **Step 2: implement store.rs; tests pass; commit** `git commit -am "Add sqlite message store"`
+- [ ] **Step 3: failing embed render tests** (footer from list, deep-link present, >4096 body splits, stats line formatting)
+- [ ] **Step 4: implement embed builder + FOOTERS; switch hot path from content to embed; tests pass; commit** `git commit -am "Render as embeds with footer + deep link"`
+- [ ] **Step 5: implement post_embed id capture + patch_embed; extend deliver_test with PATCH mock; commit** `git commit -am "Capture discord message ids; add embed PATCH"`
+- [ ] **Step 6: implement refresh worker with fetcher trait (`trait PostFetcher` so tests inject fakes); diff-logic tests pass; wire into main; commit** `git commit -am "Add refresh worker: reactions, comments, edits, deletes"`
+
 ### Task 8: Live acceptance on frostbyte
 
 **Files:**
