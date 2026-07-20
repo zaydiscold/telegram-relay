@@ -1,0 +1,16 @@
+routes:
+  - name: robs-thoughts
+    from: "@robthinks"          # @username or numeric chat id
+    to: [discord_robs]          # fan-out: list more webhook names
+    # filter:
+    #   any_keywords: ["entry", "alert"]
+    #   exclude_hashtags: ["#ad"]
+
+webhooks:
+  discord_robs: { env: DISCORD_WEBHOOK_ROBS }
+
+ops_webhook: { env: DISCORD_WEBHOOK_OPS }   # optional: startup/error notices
+
+media:
+  mode: reupload            # reupload | placeholder
+  max_bytes: 10000000
