@@ -4,6 +4,9 @@ use crate::config::WebhookUrl;
 use std::time::Duration;
 use tracing::warn;
 
+const RATE_LIMIT_BUDGET_SECS: f64 = 60.0;
+const MAX_429_ATTEMPTS: usize = 20;
+
 pub struct Deliverer {
     http: reqwest::Client,
 }
@@ -66,13 +69,30 @@ impl Deliverer {
             Duration::from_secs(4),
         ];
         let mut attempt = 0;
+        let mut rate_limit_attempts = 0;
+        let mut rate_limit_cumulative_wait = 0.0;
         loop {
             let resp = self.http.post(&target).json(body).send().await;
             match resp {
                 Ok(r) if r.status().is_success() => return Outcome::Delivered,
                 Ok(r) if r.status().as_u16() == 429 => {
+                    rate_limit_attempts += 1;
+                    if rate_limit_attempts >= MAX_429_ATTEMPTS {
+                        return Outcome::Dropped {
+                            reason: format!("rate limited beyond {} attempts", MAX_429_ATTEMPTS),
+                        };
+                    }
                     let wait = retry_after_secs(&r).unwrap_or(1.0);
+                    if rate_limit_cumulative_wait + wait > RATE_LIMIT_BUDGET_SECS {
+                        return Outcome::Dropped {
+                            reason: format!(
+                                "rate limited beyond {:.1}s budget",
+                                RATE_LIMIT_BUDGET_SECS
+                            ),
+                        };
+                    }
                     warn!(wait, "discord 429; honoring retry_after");
+                    rate_limit_cumulative_wait += wait;
                     tokio::time::sleep(Duration::from_secs_f64(wait)).await;
                     // 429 does not consume a backoff attempt
                 }

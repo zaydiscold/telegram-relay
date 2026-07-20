@@ -54,6 +54,18 @@ async fn posts_chunks_in_order() {
     assert!(bodies[0].contains("one") && bodies[1].contains("two"));
 }
 
+async fn always_ratelimit(
+    State(h): State<Hits>,
+    body: String,
+) -> (StatusCode, [(&'static str, &'static str); 1], String) {
+    h.0.lock().unwrap().push(body);
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [("Retry-After", "0")],
+        "{}".into(),
+    )
+}
+
 #[tokio::test]
 async fn retries_on_429() {
     let hits = Hits::default();
@@ -67,4 +79,21 @@ async fn retries_on_429() {
     let out = d.post_text(&WebhookUrl(url), "Rob", &["x".into()]).await;
     assert!(matches!(out, Outcome::Delivered));
     assert_eq!(hits.0.lock().unwrap().len(), 2); // 429 then 200
+}
+
+#[tokio::test]
+async fn gives_up_after_429_budget() {
+    let hits = Hits::default();
+    let url = spawn(
+        Router::new()
+            .route("/hook", post(always_ratelimit))
+            .with_state(hits.clone()),
+    )
+    .await;
+    let d = Deliverer::new();
+    let out = d.post_text(&WebhookUrl(url), "Rob", &["x".into()]).await;
+    // Should be Dropped with rate limit reason
+    assert!(matches!(out, Outcome::Dropped { reason: _ }));
+    // Should have exactly 20 requests (the attempt limit)
+    assert_eq!(hits.0.lock().unwrap().len(), 20);
 }
