@@ -284,3 +284,46 @@ and `cargo check`/`clippy`.
     `clippy::print_literal` under `-D warnings`; inline the last literal into the
     format string. `Incoming` gets `#[allow(clippy::large_enum_variant)]` (the
     `Media` variant is large, mirroring the upstream `Media` enum's own allow).
+
+## Task 7b additions (2026-07-20 — verified against vendored 0.10.0 source)
+
+Written while implementing `src/store.rs`, `src/refresh.rs`, embed rendering,
+and the refresh worker. Confirmed against
+`~/.cargo/registry/.../grammers-{client,tl-types,session}-0.10.0` and
+`cargo clippy -D warnings` / `cargo test`.
+
+1. **`get_messages_by_id` exists and is the right call.**
+   `Client::get_messages_by_id<C: Into<PeerRef>>(peer, ids: &[i32]) ->
+   Result<Vec<Option<Message>>, InvocationError>` (`src/client/messages.rs`).
+   Docs cap it at 100 ids. Result is index-aligned with the input ids; `None`
+   = not retrievable (deleted / not in peer). It auto-routes to
+   `channels::GetMessages` vs `messages::GetMessages` by peer kind.
+
+2. **Reactions ARE cleanly exposed — no stub needed.** `Message::raw` is a
+   `pub` field (`tl::enums::Message`). Per-emoji breakdown:
+   `tl::enums::Message::Message(m)` → `m.reactions:
+   Option<MessageReactions>` → `MessageReactions::Reactions(r)` →
+   `r.results: Vec<ReactionCount>`. Each `ReactionCount::Count(c)` has
+   `c.count: i32` and `c.reaction: tl::enums::Reaction`, where
+   `Reaction::Emoji(ReactionEmoji { emoticon: String })` gives the unicode
+   emoji. Other variants: `Paid`, `CustomEmoji(document_id)` (no unicode —
+   mapped to markers `⭐` / `🎨` in `refresh::extract_reactions`), `Empty`
+   (skipped). There is also a convenience `Message::reaction_count() ->
+   Option<i32>` (sum only). `tl` is re-exported as `grammers_client::tl`.
+
+3. **Comment/discussion count IS exposed:** `Message::reply_count() ->
+   Option<i32>` (from `m.replies: MessageReplies::Replies { replies }`). Used
+   as the 💬 count. `Message::view_count()` / `forward_count()` /
+   `edit_date()` are also available if needed later.
+
+4. **Fetch-by-id needs a `PeerRef` (identity + access hash).** A bare bot-API
+   `i64` is not enough for channels. `PeerId::from_bot_api_dialog_id` yields
+   only identity, not `auth`. The working path: at route resolution call
+   `Peer::to_ref().await -> Result<Option<PeerRef>, _>` on the
+   `resolve_username` result and cache `HashMap<ChatId, PeerRef>` (`PeerRef`
+   is `Copy`). Numeric-id (`ChatRef::Id`) routes have no resolved `Peer`, so
+   they are relayed live but NOT refreshed (documented limitation). `PeerRef`
+   lives at `grammers_client::session::types::PeerRef`.
+
+5. **`PeerRef: Into<PeerRef>`** via the std blanket `impl<T> From<T> for T`,
+   so it passes straight into `get_messages_by_id`.

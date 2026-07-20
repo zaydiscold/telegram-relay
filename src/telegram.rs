@@ -7,6 +7,7 @@
 //! API verified against the crate source; see
 //! `docs/superpowers/plans/api-notes.md` (Task 6 corrections) for the deltas.
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -131,12 +132,23 @@ pub async fn interactive_login(client: &Client, api_hash: &str) -> anyhow::Resul
     Ok(())
 }
 
+/// Route resolution result: the resolved routes plus a map of chat id ->
+/// [`PeerRef`] for chats we resolved a full peer for (used by the refresh worker
+/// to re-fetch messages by id, which needs the peer's access hash).
+pub struct Resolution {
+    pub routes: Vec<ResolvedRoute>,
+    pub peers: HashMap<ChatId, grammers_client::session::types::PeerRef>,
+}
+
 /// Resolve each configured route's `from` into a concrete [`ChatId`].
 ///
-/// `ChatRef::Username` is resolved via `resolve_username`; `ChatRef::Id` is used
-/// as-is. Logs `route '{name}' watching '{title}' ({id})` per route.
-pub async fn resolve_routes(client: &Client, cfg: &Config) -> anyhow::Result<Vec<ResolvedRoute>> {
+/// `ChatRef::Username` is resolved via `resolve_username` (and its `PeerRef` is
+/// captured for refresh); `ChatRef::Id` is used as-is (no `PeerRef`, so numeric
+/// routes are not refreshable — they still relay live). Logs
+/// `route '{name}' watching '{title}' ({id})` per route.
+pub async fn resolve_routes(client: &Client, cfg: &Config) -> anyhow::Result<Resolution> {
     let mut resolved = Vec::with_capacity(cfg.routes.len());
+    let mut peers = HashMap::new();
     for route in &cfg.routes {
         let (chat, title) = match &route.from {
             ChatRef::Username(username) => {
@@ -149,6 +161,9 @@ pub async fn resolve_routes(client: &Client, cfg: &Config) -> anyhow::Result<Vec
                     })?;
                 let id = peer.id().bot_api_dialog_id_unchecked();
                 let title = peer.name().unwrap_or(username).to_string();
+                if let Ok(Some(pref)) = peer.to_ref().await {
+                    peers.insert(ChatId(id), pref);
+                }
                 (ChatId(id), title)
             }
             ChatRef::Id(id) => (*id, format!("id:{}", id.0)),
@@ -161,7 +176,10 @@ pub async fn resolve_routes(client: &Client, cfg: &Config) -> anyhow::Result<Vec
             filter: route.filter.clone(),
         });
     }
-    Ok(resolved)
+    Ok(Resolution {
+        routes: resolved,
+        peers,
+    })
 }
 
 /// Print an `id  type  title` table of all dialogs (the `chats` CLI verb).
@@ -189,6 +207,10 @@ pub enum Incoming {
         body: String,
         reply_quote: Option<String>,
         edited: bool,
+        /// Channel/chat title, for the embed author.
+        title: Option<String>,
+        /// `t.me` deep link to this message, if the chat has a public username.
+        deep_link: Option<String>,
     },
     Media {
         chat: ChatId,
@@ -238,6 +260,11 @@ pub fn classify(update: Update) -> Option<Incoming> {
             deep_link,
         })
     } else {
+        let title = message.peer().and_then(|p| p.name()).map(|s| s.to_string());
+        let deep_link = message
+            .peer()
+            .and_then(|p| p.username())
+            .map(|u| format!("https://t.me/{u}/{msg_id}"));
         Some(Incoming::Text {
             chat,
             msg_id,
@@ -247,6 +274,8 @@ pub fn classify(update: Update) -> Option<Incoming> {
             // requires a follow-up fetch (handled in the enrichment lane).
             reply_quote: None,
             edited,
+            title,
+            deep_link,
         })
     }
 }

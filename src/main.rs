@@ -23,10 +23,12 @@ use tracing_subscriber::EnvFilter;
 use telegram_relay::cli::{Cli, Command, SESSION_FILE};
 use telegram_relay::config::{Config, MediaCfg, MediaMode, WebhookName, WebhookUrl};
 use telegram_relay::dedup::Dedup;
-use telegram_relay::deliver::{Deliverer, Outcome};
+use telegram_relay::deliver::{Deliverer, Outcome, PostResult};
 use telegram_relay::media::{sort_album_batch, AlbumBuffer, MediaItem};
-use telegram_relay::render::{self, passes_filter, RelayText};
+use telegram_relay::refresh::{self, content_hash, GrammersFetcher};
+use telegram_relay::render::{self, passes_filter, EmbedMeta, RelayText};
 use telegram_relay::router::{ResolvedRoute, Router};
+use telegram_relay::store::{NewRecord, Store};
 use telegram_relay::telegram::{self, Incoming};
 
 use grammers_client::media::Media;
@@ -155,8 +157,8 @@ async fn check(config_path: &Path) -> anyhow::Result<()> {
                         println!("\n{:<24}  {:<8}  detail", "route", "status");
                         println!("{}", "-".repeat(60));
                         match telegram::resolve_routes(&conn.client, &cfg).await {
-                            Ok(routes) => {
-                                for r in &routes {
+                            Ok(res) => {
+                                for r in &res.routes {
                                     println!("{:<24}  {:<8}  chat {}", r.name, "ok", r.chat.0);
                                 }
                             }
@@ -278,6 +280,9 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
     let deliverer = Arc::new(Deliverer::new());
     let ops = Ops::new(deliverer.clone(), cfg.ops_webhook.clone());
 
+    let store = Arc::new(Store::open(&cfg.store.path).context("opening message store")?);
+    info!("message store at {}", cfg.store.path.display());
+
     let conn = telegram::connect(api_id, Path::new(SESSION_FILE)).await?;
     if !conn.client.is_authorized().await? {
         conn.handle.quit();
@@ -296,7 +301,33 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
             return Err(e);
         }
     };
-    let live = Arc::new(ArcSwap::from_pointee(Live::build(resolved, &cfg)));
+    // Peer refs for the refresh worker (keyed by bot-API chat id).
+    let peer_refs = resolved
+        .peers
+        .iter()
+        .map(|(chat, pref)| (chat.0, *pref))
+        .collect::<HashMap<_, _>>();
+    let live = Arc::new(ArcSwap::from_pointee(Live::build(resolved.routes, &cfg)));
+
+    // Spawn the refresh worker: re-fetch tracked posts on an interval, PATCH
+    // embeds whose reactions/comments/body changed, mark deletes, then prune.
+    // It holds a fixed peer map + webhook snapshot; routes added at runtime are
+    // refreshed only after a restart.
+    {
+        let fetcher = GrammersFetcher::new(conn.client.clone(), peer_refs);
+        let store = store.clone();
+        let deliverer = deliverer.clone();
+        let webhooks = cfg.webhooks.clone();
+        let refresh_cfg = cfg.refresh;
+        tokio::spawn(async move {
+            refresh::run(fetcher, store, deliverer, webhooks, refresh_cfg).await;
+        });
+        info!(
+            interval_mins = cfg.refresh.interval_mins,
+            horizon_hours = cfg.refresh.horizon_hours,
+            "refresh worker started"
+        );
+    }
 
     let mut updates = telegram::stream_updates(&conn.client, conn.updates).await?;
     let mut dedup = Dedup::new(DEDUP_CAP);
@@ -327,7 +358,7 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
                 match update {
                     Ok(u) => {
                         handle_update(
-                            u, &conn.client, &live, &deliverer, &ops,
+                            u, &conn.client, &live, &deliverer, &ops, &store,
                             &mut dedup, &media_tx,
                         ).await;
                     }
@@ -397,8 +428,8 @@ async fn reload(config_path: &Path, client: &Client, live: &ArcSwap<Live>, ops: 
         }
     };
     match telegram::resolve_routes(client, &cfg).await {
-        Ok(routes) => {
-            live.store(Arc::new(Live::build(routes, &cfg)));
+        Ok(res) => {
+            live.store(Arc::new(Live::build(res.routes, &cfg)));
             info!("config reloaded; {} route(s)", cfg.routes.len());
         }
         Err(e) => {
@@ -410,12 +441,14 @@ async fn reload(config_path: &Path, client: &Client, live: &ArcSwap<Live>, ops: 
 }
 
 /// Classify → dedup → route → filter → dispatch one update.
+#[allow(clippy::too_many_arguments)]
 async fn handle_update(
     update: grammers_client::update::Update,
     client: &Client,
     live: &ArcSwap<Live>,
     deliverer: &Arc<Deliverer>,
     ops: &Ops,
+    store: &Arc<Store>,
     dedup: &mut Dedup,
     media_tx: &mpsc::Sender<MediaItem>,
 ) {
@@ -443,6 +476,8 @@ async fn handle_update(
             body,
             reply_quote,
             edited,
+            title,
+            deep_link,
             ..
         } => {
             for route in routes {
@@ -458,14 +493,36 @@ async fn handle_update(
                     reply_quote: reply_quote.clone(),
                     edited,
                 };
-                let chunks = render::render(&text);
-                for url in resolve_targets(route, &snapshot.webhooks) {
-                    spawn_text(
+                // A fresh post has no reactions/comments yet; the refresh worker
+                // fills those in later.
+                let meta = EmbedMeta {
+                    title: title.clone().unwrap_or_else(|| route.name.clone()),
+                    avatar_url: None,
+                    deep_link: deep_link.clone(),
+                    reactions: Default::default(),
+                    comment_count: 0,
+                    deleted: false,
+                };
+                let embeds = render::embed(&text, &meta);
+                let hash = content_hash(&body);
+                for (name, url) in resolve_targets_named(route, &snapshot.webhooks) {
+                    spawn_embed(
                         deliverer.clone(),
                         ops.clone(),
+                        store.clone(),
                         url,
+                        NewRecord {
+                            chat_id: chat.0,
+                            tg_msg_id: msg_id,
+                            route: route.name.clone(),
+                            webhook_name: name.0.clone(),
+                            discord_msg_id: String::new(), // filled on delivery
+                            content_hash: hash.clone(),
+                            reactions: Default::default(),
+                            comment_count: 0,
+                        },
                         username.clone(),
-                        chunks.clone(),
+                        embeds.clone(),
                     );
                 }
             }
@@ -590,6 +647,35 @@ async fn handle_update(
     }
 }
 
+/// Spawn a fire-and-forget embed delivery. On success, record the created
+/// Discord message id in the store so the refresh worker can PATCH it later.
+#[allow(clippy::too_many_arguments)]
+fn spawn_embed(
+    deliverer: Arc<Deliverer>,
+    ops: Ops,
+    store: Arc<Store>,
+    url: WebhookUrl,
+    mut record: NewRecord,
+    username: String,
+    embeds: serde_json::Value,
+) {
+    tokio::spawn(async move {
+        match deliverer.post_embed(&url, &username, &embeds).await {
+            PostResult::Delivered { discord_msg_id } => {
+                record.discord_msg_id = discord_msg_id;
+                if let Err(e) = store.record(record) {
+                    warn!(error = %e, "failed to record relayed message");
+                }
+            }
+            PostResult::Dropped { reason } => {
+                warn!(%reason, "embed delivery dropped");
+                ops.drop_notice(&format!("delivery dropped: {reason}"))
+                    .await;
+            }
+        }
+    });
+}
+
 /// Spawn a fire-and-forget text delivery, reporting drops to ops.
 fn spawn_text(
     deliverer: Arc<Deliverer>,
@@ -661,6 +747,25 @@ fn resolve_targets(
                 warn!(webhook = %name.0, route = %route.name, "route references unknown webhook");
             }
             url
+        })
+        .collect()
+}
+
+/// Like [`resolve_targets`] but also returns each webhook's name, needed to
+/// record which webhook a message was posted to for later PATCHing.
+fn resolve_targets_named(
+    route: &ResolvedRoute,
+    webhooks: &HashMap<WebhookName, WebhookUrl>,
+) -> Vec<(WebhookName, WebhookUrl)> {
+    route
+        .to
+        .iter()
+        .filter_map(|name| {
+            let url = webhooks.get(name).cloned();
+            if url.is_none() {
+                warn!(webhook = %name.0, route = %route.name, "route references unknown webhook");
+            }
+            url.map(|u| (name.clone(), u))
         })
         .collect()
 }

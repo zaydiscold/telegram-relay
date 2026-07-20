@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChatId(pub i64);
@@ -50,12 +50,44 @@ pub struct MediaCfg {
     pub max_bytes: u64,
 }
 
+/// Refresh-worker cadence + how far back to keep updating posts.
+#[derive(Debug, Clone, Copy)]
+pub struct RefreshCfg {
+    pub interval_mins: u64,
+    pub horizon_hours: u64,
+}
+
+impl Default for RefreshCfg {
+    fn default() -> Self {
+        RefreshCfg {
+            interval_mins: 30,
+            horizon_hours: 48,
+        }
+    }
+}
+
+/// Where the sqlite message store lives.
+#[derive(Debug, Clone)]
+pub struct StoreCfg {
+    pub path: PathBuf,
+}
+
+impl Default for StoreCfg {
+    fn default() -> Self {
+        StoreCfg {
+            path: PathBuf::from("relay.db"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Config {
     pub routes: Vec<RouteCfg>,
     pub webhooks: HashMap<WebhookName, WebhookUrl>,
     pub ops_webhook: Option<WebhookUrl>,
     pub media: MediaCfg,
+    pub refresh: RefreshCfg,
+    pub store: StoreCfg,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -89,6 +121,31 @@ mod raw {
         pub webhooks: HashMap<String, EnvRef>,
         pub ops_webhook: Option<EnvRef>,
         pub media: Media,
+        #[serde(default)]
+        pub refresh: Option<Refresh>,
+        #[serde(default)]
+        pub store: Option<Store>,
+    }
+    #[derive(Deserialize)]
+    pub struct Refresh {
+        #[serde(default = "default_interval_mins")]
+        pub interval_mins: u64,
+        #[serde(default = "default_horizon_hours")]
+        pub horizon_hours: u64,
+    }
+    fn default_interval_mins() -> u64 {
+        30
+    }
+    fn default_horizon_hours() -> u64 {
+        48
+    }
+    #[derive(Deserialize)]
+    pub struct Store {
+        #[serde(default = "default_store_path")]
+        pub path: String,
+    }
+    fn default_store_path() -> String {
+        "relay.db".to_string()
     }
     #[derive(Deserialize)]
     pub struct Route {
@@ -194,6 +251,16 @@ impl Config {
             "placeholder" => MediaMode::Placeholder,
             _ => MediaMode::Reupload,
         };
+        let refresh = raw
+            .refresh
+            .map_or_else(RefreshCfg::default, |r| RefreshCfg {
+                interval_mins: r.interval_mins,
+                horizon_hours: r.horizon_hours,
+            });
+        let store = raw.store.map_or_else(StoreCfg::default, |s| StoreCfg {
+            path: PathBuf::from(s.path),
+        });
+
         Ok(Config {
             routes,
             webhooks,
@@ -202,6 +269,8 @@ impl Config {
                 mode,
                 max_bytes: raw.media.max_bytes,
             },
+            refresh,
+            store,
         })
     }
 }
@@ -226,6 +295,32 @@ mod tests {
         let c = Config::load(&p).unwrap();
         assert_eq!(c.routes.len(), 1);
         assert!(matches!(c.routes[0].from, ChatRef::Username(ref u) if u == "chan"));
+    }
+
+    #[test]
+    fn refresh_and_store_default_when_absent() {
+        std::env::set_var("TEST_HOOK_DEF", "https://discord.com/api/webhooks/1/x");
+        let p = write_tmp(
+            "refresh_store_defaults",
+            "routes: []\nwebhooks:\n  h1: { env: TEST_HOOK_DEF }\nmedia: { mode: reupload, max_bytes: 1000 }\n",
+        );
+        let c = Config::load(&p).unwrap();
+        assert_eq!(c.refresh.interval_mins, 30);
+        assert_eq!(c.refresh.horizon_hours, 48);
+        assert_eq!(c.store.path, std::path::PathBuf::from("relay.db"));
+    }
+
+    #[test]
+    fn refresh_and_store_override_parses() {
+        std::env::set_var("TEST_HOOK_OVR", "https://discord.com/api/webhooks/1/x");
+        let p = write_tmp(
+            "refresh_store_override",
+            "routes: []\nwebhooks:\n  h1: { env: TEST_HOOK_OVR }\nmedia: { mode: reupload, max_bytes: 1000 }\nrefresh: { interval_mins: 15, horizon_hours: 72 }\nstore: { path: /tmp/custom.db }\n",
+        );
+        let c = Config::load(&p).unwrap();
+        assert_eq!(c.refresh.interval_mins, 15);
+        assert_eq!(c.refresh.horizon_hours, 72);
+        assert_eq!(c.store.path, std::path::PathBuf::from("/tmp/custom.db"));
     }
 
     #[test]

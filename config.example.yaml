@@ -14,3 +14,15 @@ ops_webhook: { env: DISCORD_WEBHOOK_OPS }   # optional: startup/error notices
 media:
   mode: reupload            # reupload | placeholder
   max_bytes: 10000000
+
+# Optional. Posts are relayed as live-updating Discord embeds; the refresh
+# worker re-checks each post on this cadence and PATCHes reaction/comment/edit
+# changes (and marks deletes) until it ages past the horizon. Defaults shown.
+refresh:
+  interval_mins: 30         # how often to re-check tracked posts
+  horizon_hours: 48         # stop updating (and prune) posts older than this
+
+# Optional. SQLite file tracking relayed posts so embeds can be updated in
+# place across restarts. Defaults to relay.db in the working directory.
+store:
+  path: relay.db
