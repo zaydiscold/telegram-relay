@@ -1,3 +1,655 @@
-fn main() {
-    println!("telegram-relay: scaffold");
+//! telegram-relay daemon entrypoint + CLI dispatch.
+//!
+//! Wires everything built so far into a running relay:
+//! `run` connects to Telegram, resolves routes, and runs a `tokio::select!` loop
+//! over the update stream + SIGTERM/SIGINT + a heartbeat + a media-flush tick +
+//! a config hot-reload tick. Each update is classified → deduped → routed →
+//! filtered → dispatched (text rendered+posted, media downloaded+coalesced).
+//!
+//! See `docs/superpowers/plans/api-notes.md` for the grammers 0.10.0 API shape.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
+
+use anyhow::{anyhow, Context};
+use arc_swap::ArcSwap;
+use clap::Parser;
+use tokio::sync::Mutex;
+use tracing::{info, warn};
+use tracing_subscriber::EnvFilter;
+
+use telegram_relay::cli::{Cli, Command, SESSION_FILE};
+use telegram_relay::config::{Config, MediaCfg, MediaMode, WebhookName, WebhookUrl};
+use telegram_relay::dedup::Dedup;
+use telegram_relay::deliver::{Deliverer, Outcome};
+use telegram_relay::media::{AlbumBuffer, MediaItem};
+use telegram_relay::render::{self, passes_filter, RelayText};
+use telegram_relay::router::{ResolvedRoute, Router};
+use telegram_relay::telegram::{self, Incoming};
+
+use grammers_client::media::Media;
+use grammers_client::Client;
+
+/// Heartbeat interval — an `info!` line proving the loop is alive.
+const HEARTBEAT: Duration = Duration::from_secs(300);
+/// How often the media buffer is polled for expired albums.
+const MEDIA_TICK: Duration = Duration::from_millis(250);
+/// How often config.yaml's mtime is checked for hot-reload.
+const RELOAD_TICK: Duration = Duration::from_secs(5);
+/// Album coalescing quiet window.
+const ALBUM_WINDOW: Duration = Duration::from_secs(1);
+/// Dedup LRU capacity.
+const DEDUP_CAP: usize = 8192;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Run { config } => run(&config).await,
+        Command::Login { config } => login(&config).await,
+        Command::Chats { config } => chats(&config).await,
+        Command::Check { config } => check(&config).await,
+    }
+}
+
+/// Read `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` from the environment.
+fn api_credentials() -> anyhow::Result<(i32, String)> {
+    let api_id = std::env::var("TELEGRAM_API_ID")
+        .context("TELEGRAM_API_ID not set")?
+        .parse::<i32>()
+        .context("TELEGRAM_API_ID must be an integer")?;
+    let api_hash = std::env::var("TELEGRAM_API_HASH").context("TELEGRAM_API_HASH not set")?;
+    Ok((api_id, api_hash))
+}
+
+// ---------------------------------------------------------------------------
+// login / chats
+// ---------------------------------------------------------------------------
+
+async fn login(_config: &Path) -> anyhow::Result<()> {
+    let (api_id, api_hash) = api_credentials()?;
+    let conn = telegram::connect(api_id, Path::new(SESSION_FILE)).await?;
+    let res = telegram::interactive_login(&conn.client, &api_hash).await;
+    conn.handle.quit();
+    let _ = conn.pool_task.await;
+    res
+}
+
+async fn chats(_config: &Path) -> anyhow::Result<()> {
+    let (api_id, _) = api_credentials()?;
+    let conn = telegram::connect(api_id, Path::new(SESSION_FILE)).await?;
+    if !conn.client.is_authorized().await? {
+        conn.handle.quit();
+        let _ = conn.pool_task.await;
+        return Err(anyhow!("not authorized; run `telegram-relay login` first"));
+    }
+    let res = telegram::list_chats(&conn.client).await;
+    conn.handle.quit();
+    let _ = conn.pool_task.await;
+    res
+}
+
+// ---------------------------------------------------------------------------
+// check
+// ---------------------------------------------------------------------------
+
+/// Validate config + webhook reachability (+ route resolution if a session
+/// exists). Prints a table and exits with code 0 (all good) or 1 (any failure).
+/// Never sends a message — GET on a Discord webhook returns its JSON metadata.
+async fn check(config_path: &Path) -> anyhow::Result<()> {
+    let cfg = Config::load(config_path).context("loading config")?;
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?;
+
+    let mut all_ok = true;
+    println!("{:<24}  {:<8}  detail", "webhook", "status");
+    println!("{}", "-".repeat(60));
+
+    // Named webhooks + optional ops webhook.
+    let mut targets: Vec<(String, WebhookUrl)> = cfg
+        .webhooks
+        .iter()
+        .map(|(n, u)| (n.0.clone(), u.clone()))
+        .collect();
+    targets.sort_by(|a, b| a.0.cmp(&b.0));
+    if let Some(ops) = &cfg.ops_webhook {
+        targets.push(("ops_webhook".to_string(), ops.clone()));
+    }
+
+    for (name, url) in &targets {
+        match http.get(&url.0).send().await {
+            Ok(r) if r.status().is_success() => {
+                let body = r.text().await.unwrap_or_default();
+                let detail = webhook_label(&body);
+                println!("{name:<24}  {:<8}  {detail}", "ok");
+            }
+            Ok(r) => {
+                all_ok = false;
+                println!("{name:<24}  {:<8}  HTTP {}", "FAIL", r.status().as_u16());
+            }
+            Err(e) => {
+                all_ok = false;
+                println!("{name:<24}  {:<8}  {e}", "FAIL");
+            }
+        }
+    }
+
+    // Route resolution — only if a session file already exists.
+    if Path::new(SESSION_FILE).exists() {
+        match api_credentials() {
+            Ok((api_id, _)) => match telegram::connect(api_id, Path::new(SESSION_FILE)).await {
+                Ok(conn) => {
+                    if conn.client.is_authorized().await.unwrap_or(false) {
+                        println!("\n{:<24}  {:<8}  detail", "route", "status");
+                        println!("{}", "-".repeat(60));
+                        match telegram::resolve_routes(&conn.client, &cfg).await {
+                            Ok(routes) => {
+                                for r in &routes {
+                                    println!("{:<24}  {:<8}  chat {}", r.name, "ok", r.chat.0);
+                                }
+                            }
+                            Err(e) => {
+                                all_ok = false;
+                                println!("{:<24}  {:<8}  {e}", "(resolution)", "FAIL");
+                            }
+                        }
+                    } else {
+                        println!("\nsession present but not authorized; skipping route check");
+                    }
+                    conn.handle.quit();
+                    let _ = conn.pool_task.await;
+                }
+                Err(e) => {
+                    all_ok = false;
+                    println!("\nconnect failed: {e}");
+                }
+            },
+            Err(e) => {
+                println!("\nsession present but credentials missing; skipping route check: {e}");
+            }
+        }
+    } else {
+        println!("\nno session file ({SESSION_FILE}); skipping route resolution");
+    }
+
+    if all_ok {
+        println!("\nOK");
+        Ok(())
+    } else {
+        std::process::exit(1);
+    }
+}
+
+/// Extract a friendly label from a Discord webhook GET response body.
+fn webhook_label(body: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(v) => {
+            let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+            let channel = v.get("channel_id").and_then(|c| c.as_str()).unwrap_or("?");
+            format!("\"{name}\" (channel {channel})")
+        }
+        Err(_) => "reachable".to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// run — the daemon
+// ---------------------------------------------------------------------------
+
+/// Hot-swappable routing snapshot.
+struct Live {
+    router: Router,
+    webhooks: HashMap<WebhookName, WebhookUrl>,
+    media: MediaCfg,
+}
+
+impl Live {
+    fn build(routes: Vec<ResolvedRoute>, cfg: &Config) -> Self {
+        Live {
+            router: Router::new(routes),
+            webhooks: cfg.webhooks.clone(),
+            media: cfg.media.clone(),
+        }
+    }
+}
+
+/// Ops-webhook notifier. Lifecycle/error notices go out unconditionally; drop
+/// notices are rate-limited to at most one per minute to avoid flooding.
+#[derive(Clone)]
+struct Ops {
+    deliverer: Arc<Deliverer>,
+    url: Option<WebhookUrl>,
+    last_drop: Arc<Mutex<Option<Instant>>>,
+}
+
+impl Ops {
+    fn new(deliverer: Arc<Deliverer>, url: Option<WebhookUrl>) -> Self {
+        Ops {
+            deliverer,
+            url,
+            last_drop: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Unconditional notice (startup, shutdown, resolution failures).
+    async fn notice(&self, msg: &str) {
+        if let Some(url) = &self.url {
+            let _ = self
+                .deliverer
+                .post_text(url, "relay-ops", &[msg.to_string()])
+                .await;
+        }
+    }
+
+    /// Drop notice, rate-limited to 1/min.
+    async fn drop_notice(&self, msg: &str) {
+        if self.url.is_none() {
+            return;
+        }
+        {
+            let mut guard = self.last_drop.lock().await;
+            let now = Instant::now();
+            let allow = guard.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(60));
+            if !allow {
+                return;
+            }
+            *guard = Some(now);
+        }
+        self.notice(msg).await;
+    }
+}
+
+async fn run(config_path: &Path) -> anyhow::Result<()> {
+    let (api_id, _api_hash) = api_credentials()?;
+    let cfg = Config::load(config_path).context("loading config")?;
+
+    let deliverer = Arc::new(Deliverer::new());
+    let ops = Ops::new(deliverer.clone(), cfg.ops_webhook.clone());
+
+    let conn = telegram::connect(api_id, Path::new(SESSION_FILE)).await?;
+    if !conn.client.is_authorized().await? {
+        conn.handle.quit();
+        let _ = conn.pool_task.await;
+        return Err(anyhow!("not authorized; run `telegram-relay login` first"));
+    }
+
+    // Initial route resolution — fatal if it fails (nothing to route).
+    let resolved = match telegram::resolve_routes(&conn.client, &cfg).await {
+        Ok(r) => r,
+        Err(e) => {
+            ops.notice(&format!("startup route resolution failed: {e}"))
+                .await;
+            conn.handle.quit();
+            let _ = conn.pool_task.await;
+            return Err(e);
+        }
+    };
+    let live = Arc::new(ArcSwap::from_pointee(Live::build(resolved, &cfg)));
+
+    let mut updates = telegram::stream_updates(&conn.client, conn.updates).await?;
+    let mut dedup = Dedup::new(DEDUP_CAP);
+    let mut album = AlbumBuffer::new(ALBUM_WINDOW);
+
+    let mut heartbeat = tokio::time::interval(HEARTBEAT);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut media_tick = tokio::time::interval(MEDIA_TICK);
+    let mut reload_tick = tokio::time::interval(RELOAD_TICK);
+    let mut last_mtime = file_mtime(config_path);
+
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing SIGTERM handler")?;
+
+    info!("relay started; watching {} route(s)", cfg.routes.len());
+    ops.notice("relay started").await;
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => { info!("SIGINT received"); break; }
+            _ = sigterm.recv() => { info!("SIGTERM received"); break; }
+
+            update = updates.next() => {
+                match update {
+                    Ok(u) => {
+                        handle_update(
+                            u, &conn.client, &live, &deliverer, &ops,
+                            &mut dedup, &mut album,
+                        ).await;
+                    }
+                    Err(e) => warn!(error = %e, "update stream error"),
+                }
+            }
+
+            _ = media_tick.tick() => {
+                while let Some(batch) = album.tick().await {
+                    let d = deliverer.clone();
+                    let ops = ops.clone();
+                    tokio::spawn(async move { flush_album(&d, &ops, batch).await; });
+                }
+            }
+
+            _ = heartbeat.tick() => {
+                info!(pending_albums = album.pending_groups(), "heartbeat");
+            }
+
+            _ = reload_tick.tick() => {
+                let current = file_mtime(config_path);
+                if current != last_mtime {
+                    last_mtime = current;
+                    reload(config_path, &conn.client, &live, &ops).await;
+                }
+            }
+        }
+    }
+
+    info!("shutting down");
+    ops.notice("relay shutting down").await;
+    let _ = updates.sync_update_state().await;
+    conn.handle.quit();
+    let _ = conn.pool_task.await;
+    Ok(())
+}
+
+fn file_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Re-load config, re-resolve routes, and swap the [`Live`] snapshot.
+/// Credential/session changes still require a restart.
+async fn reload(config_path: &Path, client: &Client, live: &ArcSwap<Live>, ops: &Ops) {
+    let cfg = match Config::load(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "config reload: parse failed; keeping previous");
+            return;
+        }
+    };
+    match telegram::resolve_routes(client, &cfg).await {
+        Ok(routes) => {
+            live.store(Arc::new(Live::build(routes, &cfg)));
+            info!("config reloaded; {} route(s)", cfg.routes.len());
+        }
+        Err(e) => {
+            warn!(error = %e, "config reload: route resolution failed; keeping previous");
+            ops.notice(&format!("route resolution failed on reload: {e}"))
+                .await;
+        }
+    }
+}
+
+/// Classify → dedup → route → filter → dispatch one update.
+async fn handle_update(
+    update: grammers_client::update::Update,
+    client: &Client,
+    live: &ArcSwap<Live>,
+    deliverer: &Arc<Deliverer>,
+    ops: &Ops,
+    dedup: &mut Dedup,
+    album: &mut AlbumBuffer,
+) {
+    let Some(incoming) = telegram::classify(update) else {
+        return;
+    };
+
+    let (chat, msg_id) = match &incoming {
+        Incoming::Text { chat, msg_id, .. } => (*chat, *msg_id),
+        Incoming::Media { chat, msg_id, .. } => (*chat, *msg_id),
+    };
+    if !dedup.check_and_insert(chat, msg_id) {
+        return; // duplicate
+    }
+
+    let snapshot = live.load_full();
+    let routes = snapshot.router.match_chat(chat);
+    if routes.is_empty() {
+        return;
+    }
+
+    match incoming {
+        Incoming::Text {
+            sender,
+            body,
+            reply_quote,
+            edited,
+            ..
+        } => {
+            for route in routes {
+                if let Some(f) = &route.filter {
+                    if !passes_filter(&body, f) {
+                        continue;
+                    }
+                }
+                let username = display_name(sender.as_deref(), &route.name);
+                let text = RelayText {
+                    sender: sender.clone(),
+                    body: body.clone(),
+                    reply_quote: reply_quote.clone(),
+                    edited,
+                };
+                let chunks = render::render(&text);
+                for url in resolve_targets(route, &snapshot.webhooks) {
+                    spawn_text(
+                        deliverer.clone(),
+                        ops.clone(),
+                        url,
+                        username.clone(),
+                        chunks.clone(),
+                    );
+                }
+            }
+        }
+        Incoming::Media {
+            grouped_id,
+            media,
+            caption,
+            sender,
+            approx_size,
+            deep_link,
+            ..
+        } => {
+            // Determine which routes actually want this (filter on caption).
+            let mut wanted: Vec<(&ResolvedRoute, Vec<WebhookUrl>)> = Vec::new();
+            for route in routes {
+                if let Some(f) = &route.filter {
+                    if !passes_filter(&caption, f) {
+                        continue;
+                    }
+                }
+                let targets = resolve_targets(route, &snapshot.webhooks);
+                if !targets.is_empty() {
+                    wanted.push((route, targets));
+                }
+            }
+            if wanted.is_empty() {
+                return;
+            }
+
+            // Oversized (or placeholder mode): post a text notice with the deep
+            // link instead of downloading/re-uploading.
+            let oversized = approx_size > snapshot.media.max_bytes;
+            if oversized || snapshot.media.mode == MediaMode::Placeholder {
+                let link = deep_link.unwrap_or_else(|| "(no public link)".to_string());
+                let note = if oversized {
+                    format!("[media too large to relay — {approx_size} bytes]\n{link}")
+                } else {
+                    format!("[media]\n{link}")
+                };
+                let body = if caption.is_empty() {
+                    note
+                } else {
+                    format!("{caption}\n{note}")
+                };
+                for (route, targets) in &wanted {
+                    let username = display_name(sender.as_deref(), &route.name);
+                    let text = RelayText {
+                        sender: sender.clone(),
+                        body: body.clone(),
+                        reply_quote: None,
+                        edited: false,
+                    };
+                    let chunks = render::render(&text);
+                    for url in targets {
+                        spawn_text(
+                            deliverer.clone(),
+                            ops.clone(),
+                            url.clone(),
+                            username.clone(),
+                            chunks.clone(),
+                        );
+                    }
+                }
+                return;
+            }
+
+            // Download bytes in-memory, then push into the album buffer.
+            let bytes = match download_media(client, &media).await {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(error = %e, msg_id, "media download failed");
+                    ops.drop_notice(&format!("media download failed (msg {msg_id}): {e}"))
+                        .await;
+                    return;
+                }
+            };
+            let filename = media_filename(&media, msg_id);
+
+            // One MediaItem per matching route (each carries its own targets),
+            // but only the first route's item keeps the caption to avoid dupes.
+            for (i, (route, targets)) in wanted.into_iter().enumerate() {
+                let username = display_name(sender.as_deref(), &route.name);
+                let item = MediaItem {
+                    grouped_id,
+                    msg_id,
+                    chat,
+                    username,
+                    filename: filename.clone(),
+                    bytes: bytes.clone(),
+                    caption: if i == 0 {
+                        caption.clone()
+                    } else {
+                        String::new()
+                    },
+                    targets,
+                };
+                if let Some(batch) = album.push(item).await {
+                    let d = deliverer.clone();
+                    let ops = ops.clone();
+                    tokio::spawn(async move {
+                        flush_album(&d, &ops, batch).await;
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Spawn a fire-and-forget text delivery, reporting drops to ops.
+fn spawn_text(
+    deliverer: Arc<Deliverer>,
+    ops: Ops,
+    url: WebhookUrl,
+    username: String,
+    chunks: Vec<String>,
+) {
+    tokio::spawn(async move {
+        if let Outcome::Dropped { reason } = deliverer.post_text(&url, &username, &chunks).await {
+            warn!(%reason, "text delivery dropped");
+            ops.drop_notice(&format!("delivery dropped: {reason}"))
+                .await;
+        }
+    });
+}
+
+/// Post an album batch: optional caption text first, then each file, per target.
+async fn flush_album(deliverer: &Deliverer, ops: &Ops, batch: Vec<MediaItem>) {
+    let Some(first) = batch.first() else {
+        return;
+    };
+    for target in &first.targets {
+        if !first.caption.is_empty() {
+            let text = RelayText {
+                sender: None,
+                body: first.caption.clone(),
+                reply_quote: None,
+                edited: false,
+            };
+            let chunks = render::render(&text);
+            if let Outcome::Dropped { reason } =
+                deliverer.post_text(target, &first.username, &chunks).await
+            {
+                warn!(%reason, "album caption dropped");
+                ops.drop_notice(&format!("album caption dropped: {reason}"))
+                    .await;
+            }
+        }
+        for item in &batch {
+            if let Outcome::Dropped { reason } = deliverer
+                .post_file(target, &item.username, &item.filename, item.bytes.clone())
+                .await
+            {
+                warn!(%reason, filename = %item.filename, "media upload dropped");
+                ops.drop_notice(&format!("media upload dropped: {reason}"))
+                    .await;
+            }
+        }
+    }
+}
+
+/// Resolve a route's webhook names into concrete URLs against the snapshot map.
+fn resolve_targets(
+    route: &ResolvedRoute,
+    webhooks: &HashMap<WebhookName, WebhookUrl>,
+) -> Vec<WebhookUrl> {
+    route
+        .to
+        .iter()
+        .filter_map(|name| {
+            let url = webhooks.get(name).cloned();
+            if url.is_none() {
+                warn!(webhook = %name.0, route = %route.name, "route references unknown webhook");
+            }
+            url
+        })
+        .collect()
+}
+
+/// Discord display name: prefer the message sender, fall back to the route name.
+fn display_name(sender: Option<&str>, route_name: &str) -> String {
+    match sender {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => route_name.to_string(),
+    }
+}
+
+/// Download a media file fully into memory via the chunked download iterator.
+async fn download_media(client: &Client, media: &Media) -> anyhow::Result<Vec<u8>> {
+    let mut download = client.iter_download(media);
+    let mut bytes = Vec::new();
+    while let Some(chunk) = download.next().await? {
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+/// Best-effort filename for an attachment.
+fn media_filename(media: &Media, msg_id: i32) -> String {
+    match media {
+        Media::Document(d) => d
+            .name()
+            .filter(|n| !n.is_empty())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| format!("file_{msg_id}.bin")),
+        Media::Photo(_) => format!("photo_{msg_id}.jpg"),
+        Media::Sticker(_) => format!("sticker_{msg_id}.webp"),
+        _ => format!("media_{msg_id}.bin"),
+    }
 }

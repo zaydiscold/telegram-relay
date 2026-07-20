@@ -8,7 +8,7 @@ description = "Fast Telegram → Discord webhook relay (MTProto userbot)"
 [dependencies]
 grammers-client = "=0.10.0"
 grammers-session = "=0.10.0"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs", "test-util"] }
 reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
@@ -21,6 +21,7 @@ dotenvy = "0.15"
 anyhow = "1"
 thiserror = "2"
 rpassword = "7"
+arc-swap = "1"
 
 [dev-dependencies]
 axum = "0.8"

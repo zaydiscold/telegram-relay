@@ -1,6 +1,8 @@
+pub mod cli;
 pub mod config;
 pub mod dedup;
 pub mod deliver;
+pub mod media;
 pub mod render;
 pub mod router;
 pub mod telegram;
