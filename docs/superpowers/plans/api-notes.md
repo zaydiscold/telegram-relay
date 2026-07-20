@@ -216,3 +216,71 @@ edition is per-crate, not transitively forced by a dependency.
   `grammers_client::message::Message` — both module names appeared in the
   crate's module listing; disambiguate with `cargo doc --open` or `cargo expand`
   when router.rs is implemented.
+
+## Task 6 corrections (2026-07-20 — verified by compiling telegram.rs against 0.10.0 source)
+
+Written while implementing `src/telegram.rs`. All confirmed against the vendored
+crate source in `~/.cargo/registry/.../grammers-{client,session,mtsender}-0.10.0`
+and `cargo check`/`clippy`.
+
+1. **`SenderPool` IS re-exported at the crate root.** The earlier note said it is
+   not. `grammers_client/src/lib.rs` has:
+   `pub use grammers_mtsender::{self as sender, InvocationError, SenderPool};`
+   So `use grammers_client::{Client, SenderPool, SignInError};` works directly.
+
+2. **`ClientConfiguration` / `UpdatesConfiguration` live under `grammers_client::client`,
+   NOT the crate root.** Import path: `grammers_client::client::{ClientConfiguration, UpdatesConfiguration}`.
+
+3. **`Client` is built with `Client::new(handle)` or `Client::with_configuration(handle, ClientConfiguration)`**
+   where `handle: SenderPoolFatHandle` (Clone). `SenderPool::new(Arc<S>, api_id: i32)`
+   takes only the api_id — NOT api_hash. `api_hash` is only needed for
+   `request_login_code(phone, api_hash)`.
+
+4. **`UpdatesConfiguration` has two fields**: `catch_up: bool` and
+   `update_queue_limit: Option<usize>`; it impls `Default` (catch_up=false,
+   limit=Some(100)), so `UpdatesConfiguration { catch_up: true, ..Default::default() }`
+   is correct. `catch_up: true` is confirmed to drive `MessageBoxes::load(session.updates_state())`.
+
+5. **Catch-up needs NO `state.json`.** `SqliteSession` (feature `sqlite-storage`,
+   which is a *default* feature of `grammers-session`, so enabled via our direct
+   dep even though `grammers-client` pulls session with `default-features=false`)
+   persists auth key, cached peers AND update state to the sqlite file
+   automatically (each trait method commits its own transaction). So the library
+   handles catch-up; the plan's `state.json` fallback is unnecessary and was not
+   implemented. `SqliteSession::open(path).await? -> Result<Self, SqliteSessionError>`.
+
+6. **`connect()` cannot return a bare `Client`.** In 0.10.0 the update stream is a
+   separate channel (`SenderPool { runner, handle, updates }`) driven by a
+   background `runner.run()` task. `telegram::connect()` therefore returns a
+   `Connection { client, updates, handle, pool_task }`. A `stream_updates(client,
+   updates)` helper wraps `client.stream_updates(..)` with `catch_up: true`.
+   `updates` type: `tokio::sync::mpsc::UnboundedReceiver<grammers_session::updates::UpdatesLike>`
+   (re-exportable as `grammers_client::session::updates::UpdatesLike`).
+
+7. **`Incoming::Media.media` is `grammers_client::media::Media`**, not
+   `grammers_client::types::Media` (there is no `types` module — the brief's type
+   path is stale). Media size via `Media::size(&self) -> Option<usize>`.
+
+8. **Peer / ids.** `Dialog { raw, peer: Peer, last_message }`; `dialog.peer() -> &Peer`.
+   `Peer` enum variants are `User(User) | Group(Group) | Channel(Channel)`.
+   `Peer::id() -> PeerId`, `PeerId::bot_api_dialog_id_unchecked() -> i64` gives the
+   Bot-API-style id (e.g. `-100…` for channels) that matches config numeric ids —
+   used everywhere for `ChatId` so router keys line up. `Peer::name() -> Option<&str>`,
+   `Peer::username() -> Option<&str>`.
+
+9. **Message accessors** (on `crate::message::Message`, reached via `Deref` from
+   `Update::{NewMessage,MessageEdited}(update::Message)`): `id() -> i32`,
+   `peer_id() -> PeerId`, `peer() -> Option<&Peer>`, `sender() -> Option<&Peer>`,
+   `text() -> &str`, `media() -> Option<Media>`, `grouped_id() -> Option<i64>`,
+   `reply_to_message_id() -> Option<i32>`. The quoted *body* of a reply is NOT
+   carried inline (only the id) — `classify` sets `reply_quote: None`; enriching it
+   needs a follow-up fetch (deferred to the enrichment lane / Task 7b).
+
+10. **`SignInError` impls `Display + std::error::Error`** and is `Send + Sync`, so it
+    works with `?`/`anyhow`. `PasswordToken::hint() -> Option<&str>`;
+    `check_password(password_token: PasswordToken, password: impl AsRef<[u8]>)`.
+
+11. **Minor clippy gate**: `println!("{:>14} {:8} {}", "id","type","title")` trips
+    `clippy::print_literal` under `-D warnings`; inline the last literal into the
+    format string. `Incoming` gets `#[allow(clippy::large_enum_variant)]` (the
+    `Media` variant is large, mirroring the upstream `Media` enum's own allow).
