@@ -271,8 +271,8 @@ pub fn classify(update: Update) -> Option<Incoming> {
             msg_id,
             sender,
             body: message.text().to_string(),
-            // The quoted body of a reply is not carried inline by Telegram; it
-            // requires a follow-up fetch (handled in the enrichment lane).
+            // Not yet populated: resolving the quoted body requires a
+            // follow-up fetch. Field kept for forward compatibility.
             reply_quote: None,
             edited,
             title,

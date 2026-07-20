@@ -129,8 +129,10 @@ impl Deliverer {
         let form = reqwest::multipart::Form::new()
             .part("files[0]", part)
             .text("payload_json", payload);
-        // multipart Form is not clonable; single attempt + one retry on 429 only
-        self.send_once_with_429_retry(url, form).await
+        // multipart Form is not clonable, so it cannot be re-sent after
+        // consuming it in a failed request; this is a single best-effort
+        // attempt with no retry.
+        self.send_once(url, form).await
     }
 
     async fn send_json(&self, url: &WebhookUrl, body: &serde_json::Value) -> Outcome {
@@ -203,11 +205,7 @@ impl Deliverer {
         }
     }
 
-    async fn send_once_with_429_retry(
-        &self,
-        url: &WebhookUrl,
-        form: reqwest::multipart::Form,
-    ) -> Outcome {
+    async fn send_once(&self, url: &WebhookUrl, form: reqwest::multipart::Form) -> Outcome {
         let target = format!("{}?wait=true", url.0);
         let resp = self.http.post(&target).multipart(form).send().await;
         match resp {
