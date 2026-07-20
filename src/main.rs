@@ -24,7 +24,7 @@ use telegram_relay::cli::{Cli, Command, SESSION_FILE};
 use telegram_relay::config::{Config, MediaCfg, MediaMode, WebhookName, WebhookUrl};
 use telegram_relay::dedup::Dedup;
 use telegram_relay::deliver::{Deliverer, Outcome};
-use telegram_relay::media::{AlbumBuffer, MediaItem};
+use telegram_relay::media::{sort_album_batch, AlbumBuffer, MediaItem};
 use telegram_relay::render::{self, passes_filter, RelayText};
 use telegram_relay::router::{ResolvedRoute, Router};
 use telegram_relay::telegram::{self, Incoming};
@@ -608,7 +608,12 @@ fn spawn_text(
 }
 
 /// Post an album batch: optional caption text first, then each file, per target.
-async fn flush_album(deliverer: &Deliverer, ops: &Ops, batch: Vec<MediaItem>) {
+async fn flush_album(deliverer: &Deliverer, ops: &Ops, mut batch: Vec<MediaItem>) {
+    // Sort by msg_id to ensure album items are posted in canonical order.
+    // Concurrent downloads may complete out of order; sorting guarantees the
+    // caption (which rides on the first item) is paired with the correct msg_id.
+    sort_album_batch(&mut batch);
+
     let Some(first) = batch.first() else {
         return;
     };

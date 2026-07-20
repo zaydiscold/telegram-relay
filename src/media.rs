@@ -107,6 +107,15 @@ impl AlbumBuffer {
     }
 }
 
+/// Sort an album batch by msg_id in ascending order.
+///
+/// Concurrent downloads may complete out of order; sorting ensures album items
+/// are posted in canonical order and the caption (which rides on the first item)
+/// is paired with the correct msg_id.
+pub fn sort_album_batch(batch: &mut [MediaItem]) {
+    batch.sort_by_key(|item| item.msg_id);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +207,24 @@ mod tests {
         }
         assert_eq!(batches.len(), 2);
         assert_eq!(b.pending_groups(), 0);
+    }
+
+    #[test]
+    fn album_batch_sorts_by_msg_id() {
+        // Create items with msg_ids out of order: [3, 1, 2]
+        let mut batch = vec![
+            fake_item(Some(100), 3),
+            fake_item(Some(100), 1),
+            fake_item(Some(100), 2),
+        ];
+
+        // Apply the sort helper
+        sort_album_batch(&mut batch);
+
+        // Verify order is now [1, 2, 3]
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[0].msg_id, 1);
+        assert_eq!(batch[1].msg_id, 2);
+        assert_eq!(batch[2].msg_id, 3);
     }
 }
