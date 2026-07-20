@@ -56,6 +56,39 @@ pub fn reactions_from_json(s: &str) -> BTreeMap<String, i32> {
     serde_json::from_str(s).unwrap_or_default()
 }
 
+/// Restrict the store file (and its `-wal`/`-shm` siblings, if present) to
+/// owner-only permissions (0600). The relay's own message metadata should not
+/// be readable by other local users. Missing sidecar files are not an error
+/// (WAL/SHM are created on first write, and may be checkpointed away).
+#[cfg(unix)]
+fn restrict_db_permissions(path: &Path) {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    for suffix in ["", "-wal", "-shm"] {
+        let sidecar = if suffix.is_empty() {
+            path.to_path_buf()
+        } else {
+            let mut s = path.as_os_str().to_owned();
+            s.push(suffix);
+            std::path::PathBuf::from(s)
+        };
+        match fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o600)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(
+                    "failed to restrict permissions on {}: {e}",
+                    sidecar.display()
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_db_permissions(_path: &Path) {}
+
 fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -78,6 +111,7 @@ impl Store {
             .context("enabling WAL mode")?;
         conn.pragma_update(None, "synchronous", "NORMAL")
             .context("setting synchronous=NORMAL")?;
+        restrict_db_permissions(path);
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS relayed (
@@ -340,6 +374,23 @@ mod tests {
         assert_eq!(due[0].comment_count, 42);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn db_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = tmp_db("perms");
+        let _ = std::fs::remove_file(&path);
+        let _store = Store::open(&path).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
     #[test]

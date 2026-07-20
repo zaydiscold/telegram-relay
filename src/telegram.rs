@@ -55,6 +55,7 @@ pub async fn connect(api_id: i32, session_path: &Path) -> anyhow::Result<Connect
     let session = SqliteSession::open(session_path)
         .await
         .map_err(|e| anyhow!("open session {}: {e}", session_path.display()))?;
+    restrict_session_permissions(session_path);
     let session = Arc::new(session);
 
     let SenderPool {
@@ -288,6 +289,36 @@ fn peer_kind(peer: &grammers_client::peer::Peer) -> &'static str {
         Peer::Channel(_) => "channel",
     }
 }
+
+/// Restrict the session file (and its `-wal`/`-shm` siblings, if present) to
+/// owner-only permissions (0600). The session carries an auth key, so it must
+/// never be group/world readable. Missing sidecar files (WAL not yet created,
+/// or already checkpointed away) are not an error.
+#[cfg(unix)]
+fn restrict_session_permissions(session_path: &Path) {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    for suffix in ["", "-wal", "-shm"] {
+        let path = if suffix.is_empty() {
+            session_path.to_path_buf()
+        } else {
+            let mut s = session_path.as_os_str().to_owned();
+            s.push(suffix);
+            std::path::PathBuf::from(s)
+        };
+        match fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!("failed to restrict permissions on {}: {e}", path.display());
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_session_permissions(_session_path: &Path) {}
 
 fn prompt(msg: &str) -> anyhow::Result<String> {
     print!("{msg}");
