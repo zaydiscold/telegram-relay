@@ -74,6 +74,8 @@ pub enum ConfigError {
     UnknownWebhook { route: String, hook: String },
     #[error("route '{route}': 'to' must list at least one webhook")]
     EmptyTo { route: String },
+    #[error("route '{route}': 'from' must be a string or integer, got {got}")]
+    InvalidFrom { route: String, got: String },
 }
 
 // ---- raw (serde) layer: never leaves this module ----
@@ -154,11 +156,28 @@ impl Config {
                 }
             }
             let from = match &r.from {
-                serde_yaml::Value::Number(n) => ChatRef::Id(ChatId(n.as_i64().unwrap_or(0))),
+                serde_yaml::Value::Number(n) => {
+                    let id = n.as_i64().ok_or_else(|| ConfigError::InvalidFrom {
+                        route: r.name.clone(),
+                        got: format!("number {}", n),
+                    })?;
+                    ChatRef::Id(ChatId(id))
+                }
                 serde_yaml::Value::String(s) => {
                     ChatRef::Username(s.trim_start_matches('@').to_string())
                 }
-                other => ChatRef::Username(format!("{other:?}")), // rejected at resolve time
+                other => {
+                    return Err(ConfigError::InvalidFrom {
+                        route: r.name.clone(),
+                        got: match other {
+                            serde_yaml::Value::Bool(b) => format!("boolean {}", b),
+                            serde_yaml::Value::Null => "null".to_string(),
+                            serde_yaml::Value::Sequence(_) => "sequence/array".to_string(),
+                            serde_yaml::Value::Mapping(_) => "mapping/object".to_string(),
+                            _ => format!("{:?}", other),
+                        },
+                    })
+                }
             };
             routes.push(RouteCfg {
                 name: r.name,
@@ -248,5 +267,33 @@ mod tests {
     fn webhook_url_debug_is_redacted() {
         let u = WebhookUrl("https://discord.com/api/webhooks/1/SECRET".into());
         assert!(!format!("{u:?}").contains("SECRET"));
+    }
+
+    #[test]
+    fn bool_from_rejected() {
+        std::env::set_var("TEST_HOOK_BOOL", "https://discord.com/api/webhooks/1/x");
+        let p = write_tmp(
+            "bool_from_rejected",
+            "routes:\n  - name: r1\n    from: true\n    to: [h1]\nwebhooks:\n  h1: { env: TEST_HOOK_BOOL }\nmedia: { mode: reupload, max_bytes: 1000 }\n",
+        );
+        let e = Config::load(&p).unwrap_err().to_string();
+        assert!(
+            e.contains("'from'") && e.contains("from"),
+            "error should mention 'from' field: {e}"
+        );
+    }
+
+    #[test]
+    fn float_from_rejected() {
+        std::env::set_var("TEST_HOOK_FLOAT", "https://discord.com/api/webhooks/1/x");
+        let p = write_tmp(
+            "float_from_rejected",
+            "routes:\n  - name: r1\n    from: 1.5\n    to: [h1]\nwebhooks:\n  h1: { env: TEST_HOOK_FLOAT }\nmedia: { mode: reupload, max_bytes: 1000 }\n",
+        );
+        let e = Config::load(&p).unwrap_err().to_string();
+        assert!(
+            e.contains("'from'") && e.contains("from"),
+            "error should mention 'from' field: {e}"
+        );
     }
 }
