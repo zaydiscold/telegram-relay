@@ -148,7 +148,9 @@ async fn check(config_path: &Path) -> anyhow::Result<()> {
             }
             Err(e) => {
                 all_ok = false;
-                println!("{name:<24}  {:<8}  {e}", "FAIL");
+                // Print the webhook NAME (already the first column) and a
+                // URL-stripped error — never the URL, which carries the token.
+                println!("{name:<24}  {:<8}  {}", "FAIL", e.without_url());
             }
         }
     }
@@ -577,6 +579,35 @@ impl Live {
     }
 }
 
+/// Redact any Discord webhook token from a string before it is printed or
+/// posted to the ops channel: `.../webhooks/{id}/{token}` becomes
+/// `.../webhooks/{id}/«redacted»`. Defense-in-depth alongside deliver.rs's
+/// URL-stripping so no drop reason can ever egress a token, even if a future
+/// error string reintroduces the URL.
+fn scrub_webhook_tokens(s: &str) -> String {
+    const MARK: &str = "/webhooks/";
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find(MARK) {
+        out.push_str(&rest[..pos + MARK.len()]);
+        rest = &rest[pos + MARK.len()..];
+        // Webhook id = the leading digit run.
+        let id_end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        out.push_str(&rest[..id_end]);
+        rest = &rest[id_end..];
+        // A '/' then the token: redact the (non-whitespace) token run.
+        if let Some(after) = rest.strip_prefix('/') {
+            out.push_str("/«redacted»");
+            let tok_end = after.find(char::is_whitespace).unwrap_or(after.len());
+            rest = &after[tok_end..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Ops-webhook notifier. Lifecycle/error notices go out unconditionally; drop
 /// notices are rate-limited to at most one per minute to avoid flooding.
 #[derive(Clone)]
@@ -596,11 +627,15 @@ impl Ops {
     }
 
     /// Unconditional notice (startup, shutdown, resolution failures).
+    ///
+    /// The message is scrubbed of any webhook token before egress: even though
+    /// deliver.rs already strips URLs from reqwest errors, this guarantees no
+    /// drop reason can ever leak a token to the ops Discord channel.
     async fn notice(&self, msg: &str) {
         if let Some(url) = &self.url {
             let _ = self
                 .deliverer
-                .post_text(url, "relay-ops", &[msg.to_string()])
+                .post_text(url, "relay-ops", &[scrub_webhook_tokens(msg)])
                 .await;
         }
     }
@@ -1444,5 +1479,36 @@ mod album_coalesce_tests {
     #[test]
     fn empty_batch_is_none() {
         assert!(coalesce_album(vec![]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod ops_scrub_tests {
+    use super::scrub_webhook_tokens;
+
+    #[test]
+    fn redacts_webhook_token_but_keeps_context() {
+        let s = "delivery dropped: error on \
+                 https://discord.com/api/webhooks/12345/SECRETtok-EN_abc123 boom";
+        let out = scrub_webhook_tokens(s);
+        assert!(!out.contains("SECRETtok-EN_abc123"), "token leaked: {out}");
+        assert!(out.contains("/webhooks/12345/«redacted»"), "got: {out}");
+        assert!(out.contains("12345")); // the id is fine to keep
+        assert!(out.contains("boom")); // trailing context preserved
+    }
+
+    #[test]
+    fn redacts_token_at_end_of_string() {
+        let out = scrub_webhook_tokens("https://discord.com/api/webhooks/99/TOKENxyz");
+        assert!(!out.contains("TOKENxyz"), "token leaked: {out}");
+        assert!(out.ends_with("/webhooks/99/«redacted»"));
+    }
+
+    #[test]
+    fn leaves_plain_text_untouched() {
+        assert_eq!(
+            scrub_webhook_tokens("all good, no urls here"),
+            "all good, no urls here"
+        );
     }
 }
