@@ -8,7 +8,7 @@
 //!
 //! See `docs/superpowers/plans/api-notes.md` for the grammers 0.10.0 API shape.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -23,8 +23,8 @@ use tracing_subscriber::EnvFilter;
 use telegram_relay::cli::{clamp_backfill_count, Cli, Command, SESSION_FILE};
 use telegram_relay::config::{Config, MediaCfg, MediaMode, WebhookName, WebhookUrl};
 use telegram_relay::dedup::Dedup;
-use telegram_relay::deliver::{Deliverer, Outcome, PostResult};
-use telegram_relay::media::{sort_album_batch, AlbumBuffer, MediaItem};
+use telegram_relay::deliver::{Deliverer, PostResult};
+use telegram_relay::media::{sort_album_batch, AlbumBuffer, MediaItem, MediaTarget};
 use telegram_relay::refresh::{self, content_hash, GrammersFetcher};
 use telegram_relay::render::{self, passes_filter, EmbedMeta, RelayText};
 use telegram_relay::router::{ResolvedRoute, Router};
@@ -335,47 +335,153 @@ async fn backfill(
     let mut dropped = 0usize;
 
     let mut skipped_empty = 0usize;
-    for msg in &messages {
-        let msg_id = msg.id();
-        let raw_body = msg.text().to_string();
 
-        // Skip service/empty messages (e.g. a "pinned a message" action): no
-        // text and no media means nothing to relay but a blank embed.
-        if !telegram::has_relayable_content(&raw_body, msg.media().is_some()) {
+    // Fan-out targets for the coalesced-media path (backfill has one route).
+    let media_targets: Vec<MediaTarget> = targets
+        .iter()
+        .map(|(name, url)| MediaTarget {
+            route: route.name.clone(),
+            webhook: name.clone(),
+            url: url.clone(),
+        })
+        .collect();
+    let placeholder = cfg.media.mode == MediaMode::Placeholder;
+
+    // Coalesce consecutive album siblings (same grouped_id) into one group; any
+    // other message is its own group. `messages` is already oldest -> newest, so
+    // an album's siblings sit next to each other.
+    let mut groups: Vec<Vec<&grammers_client::message::Message>> = Vec::new();
+    for msg in &messages {
+        match msg.grouped_id() {
+            Some(gid) => match groups.last_mut() {
+                Some(last) if last[0].grouped_id() == Some(gid) => last.push(msg),
+                _ => groups.push(vec![msg]),
+            },
+            None => groups.push(vec![msg]),
+        }
+    }
+
+    for group in &groups {
+        let anchor = group[0];
+
+        // Skip groups with nothing relayable (service/empty messages).
+        if group
+            .iter()
+            .all(|m| matches!(telegram::route_message(m), telegram::Routing::Skip))
+        {
             info!(
-                msg_id,
-                "backfill: skipping message with no relayable content"
+                msg_id = anchor.id(),
+                "backfill: skipping group with no relayable content"
             );
-            skipped_empty += 1;
+            skipped_empty += group.len();
             continue;
         }
 
-        if let Some(f) = &route.filter {
-            if !passes_filter(&raw_body, f) {
-                skipped_filter += 1;
-                continue;
-            }
-        }
-
-        let fetched = refresh::to_fetched(msg);
-        let mut body = fetched.body.clone();
-        if msg.media().is_some() {
-            if !body.is_empty() {
-                body.push('\n');
-            }
-            body.push_str("media omitted (backfill)");
-        }
-
-        let sender = msg.sender().and_then(|p| p.name()).map(|s| s.to_string());
-        let username = display_name(sender.as_deref(), &route.name);
+        // Caption-bearing member (first with non-empty text), else the anchor.
+        // Its msg_id keys the store row + content hash, matching the refresh
+        // worker which re-fetches that id.
+        let cap = group
+            .iter()
+            .copied()
+            .find(|m| !m.text().trim().is_empty())
+            .unwrap_or(anchor);
+        let anchor_msg_id = cap.id();
+        let fetched = refresh::to_fetched(cap);
+        let raw_caption = fetched.body.clone();
         let title = if fetched.title.is_empty() {
             route.name.clone()
         } else {
             fetched.title.clone()
         };
+        let sender = cap.sender().and_then(|p| p.name()).map(|s| s.to_string());
+
+        // Filter on the caption/body (same text for a media caption or a text
+        // body, so one check covers both).
+        if let Some(f) = &route.filter {
+            if !passes_filter(&raw_caption, f) {
+                skipped_filter += group.len();
+                continue;
+            }
+        }
+
+        // Downloadable file members of the group (photo/document/sticker).
+        let file_members: Vec<&grammers_client::message::Message> = group
+            .iter()
+            .copied()
+            .filter(|m| matches!(telegram::route_message(m), telegram::Routing::File))
+            .collect();
+
+        // Real media (reupload mode): download each non-oversized file and post
+        // ONE coalesced rich embed — identical rendering + store tracking to the
+        // live media path. Stats captured now (backfilled posts already have
+        // reactions); refresh keeps them updated.
+        if !file_members.is_empty() && !placeholder {
+            let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+            for m in &file_members {
+                let media = m
+                    .media()
+                    .expect("File routing implies message.media() is Some");
+                if media.size().unwrap_or(0) as u64 > cfg.media.max_bytes {
+                    continue; // oversized: falls back to a deep-link notice below
+                }
+                match download_media(&conn.client, &media).await {
+                    Ok(bytes) => files.push((media_filename(&media, m.id()), bytes)),
+                    Err(e) => {
+                        warn!(error = %e, msg_id = m.id(), "backfill: media download failed")
+                    }
+                }
+            }
+            if !files.is_empty() {
+                let (p, d, s) = deliver_coalesced_media(
+                    &deliverer,
+                    &store,
+                    None,
+                    resolved.chat.0,
+                    anchor_msg_id,
+                    &title,
+                    &raw_caption,
+                    fetched.deep_link.as_deref(),
+                    sender.as_deref(),
+                    &fetched.reactions,
+                    fetched.comment_count,
+                    &files,
+                    &media_targets,
+                )
+                .await;
+                posted += p;
+                dropped += d;
+                skipped_dupe += s;
+                continue;
+            }
+            // else: every file oversized/failed -> deep-link notice fallback.
+        }
+
+        // Text / notice path: a plain text or link message, non-file media
+        // (poll/geo/…), unparsed media, placeholder-mode media, or the
+        // oversized-media fallback. Build the body accordingly.
+        let body = if !file_members.is_empty() {
+            let notice = if placeholder {
+                "[media]"
+            } else {
+                "[media too large to relay]"
+            };
+            if raw_caption.trim().is_empty() {
+                notice.to_string()
+            } else {
+                format!("{raw_caption}\n{notice}")
+            }
+        } else {
+            match telegram::route_message(cap) {
+                telegram::Routing::Text(b) => b,
+                // File is handled above; Skip cannot reach here (checked above).
+                _ => raw_caption.clone(),
+            }
+        };
+
+        let username = display_name(sender.as_deref(), &route.name);
         let text = RelayText {
             sender: sender.clone(),
-            body: body.clone(),
+            body,
             reply_quote: None,
             edited: false,
         };
@@ -388,18 +494,16 @@ async fn backfill(
             deleted: false,
         };
         let embeds = render::embed(&text, &meta);
-        // Hash the RAW caption (not the "media omitted (backfill)"-annotated
-        // body): the refresh worker recomputes the hash from msg.text() alone,
-        // so hashing the annotated body would make every backfilled media post
-        // look edited on the next refresh tick and get needlessly re-PATCHed.
-        let hash = content_hash(&fetched.body);
+        // Hash the RAW caption so the refresh worker (which hashes msg.text())
+        // does not see a spurious edit on its next tick.
+        let hash = content_hash(&raw_caption);
 
         for (name, url) in &targets {
-            match store.already_relayed(resolved.chat.0, msg_id, &name.0) {
+            match store.already_relayed(resolved.chat.0, anchor_msg_id, &name.0) {
                 Ok(true) => {
                     info!(
                         chat = resolved.chat.0,
-                        msg_id,
+                        msg_id = anchor_msg_id,
                         webhook = %name.0,
                         "backfill: already relayed; skipping"
                     );
@@ -408,7 +512,7 @@ async fn backfill(
                 }
                 Ok(false) => {}
                 Err(e) => {
-                    warn!(error = %e, chat = resolved.chat.0, msg_id, "backfill: dedup check failed; posting anyway");
+                    warn!(error = %e, chat = resolved.chat.0, msg_id = anchor_msg_id, "backfill: dedup check failed; posting anyway");
                 }
             }
 
@@ -416,7 +520,7 @@ async fn backfill(
                 PostResult::Delivered { discord_msg_id } => {
                     let record = NewRecord {
                         chat_id: resolved.chat.0,
-                        tg_msg_id: msg_id,
+                        tg_msg_id: anchor_msg_id,
                         route: route.name.clone(),
                         webhook_name: name.0.clone(),
                         discord_msg_id,
@@ -430,7 +534,7 @@ async fn backfill(
                     posted += 1;
                 }
                 PostResult::Dropped { reason } => {
-                    warn!(%reason, chat = resolved.chat.0, msg_id, webhook = %name.0, "backfill: delivery dropped");
+                    warn!(%reason, chat = resolved.chat.0, msg_id = anchor_msg_id, webhook = %name.0, "backfill: delivery dropped");
                     dropped += 1;
                 }
             }
@@ -622,7 +726,8 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
                 if let Some(batch) = album.push(item).await {
                     let d = deliverer.clone();
                     let ops = ops.clone();
-                    tokio::spawn(async move { flush_album(&d, &ops, batch).await; });
+                    let store = store.clone();
+                    tokio::spawn(async move { flush_album(&d, &ops, &store, batch).await; });
                 }
             }
 
@@ -630,7 +735,8 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
                 while let Some(batch) = album.tick().await {
                     let d = deliverer.clone();
                     let ops = ops.clone();
-                    tokio::spawn(async move { flush_album(&d, &ops, batch).await; });
+                    let store = store.clone();
+                    tokio::spawn(async move { flush_album(&d, &ops, &store, batch).await; });
                 }
             }
 
@@ -654,7 +760,7 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
     // Force-flush any albums still inside their quiet window so they are
     // delivered rather than dropped on shutdown.
     for batch in album.flush_all() {
-        flush_album(&deliverer, &ops, batch).await;
+        flush_album(&deliverer, &ops, &store, batch).await;
     }
 
     let _ = updates.sync_update_state().await;
@@ -784,73 +890,96 @@ async fn handle_update(
             sender,
             approx_size,
             deep_link,
+            title,
             ..
         } => {
-            // Determine which routes actually want this (filter on caption).
-            let mut wanted: Vec<(&ResolvedRoute, Vec<WebhookUrl>)> = Vec::new();
+            // Union of every matching route's webhooks (filter on caption),
+            // deduped by webhook name so a media post reaches each distinct
+            // target exactly once — even when several routes select the same
+            // webhook or an album fans out across routes.
+            let mut targets: Vec<MediaTarget> = Vec::new();
+            let mut seen: HashSet<String> = HashSet::new();
             for route in routes {
                 if let Some(f) = &route.filter {
                     if !passes_filter(&caption, f) {
                         continue;
                     }
                 }
-                let targets = resolve_targets(route, &snapshot.webhooks);
-                if !targets.is_empty() {
-                    wanted.push((route, targets));
-                }
-            }
-            if wanted.is_empty() {
-                return;
-            }
-
-            // Oversized (or placeholder mode): post a text notice with the deep
-            // link instead of downloading/re-uploading.
-            let oversized = approx_size > snapshot.media.max_bytes;
-            if oversized || snapshot.media.mode == MediaMode::Placeholder {
-                let link = deep_link.unwrap_or_else(|| "(no public link)".to_string());
-                let note = if oversized {
-                    format!("[media too large to relay — {approx_size} bytes]\n{link}")
-                } else {
-                    format!("[media]\n{link}")
-                };
-                let body = if caption.is_empty() {
-                    note
-                } else {
-                    format!("{caption}\n{note}")
-                };
-                for (route, targets) in &wanted {
-                    let username = display_name(sender.as_deref(), &route.name);
-                    let text = RelayText {
-                        sender: sender.clone(),
-                        body: body.clone(),
-                        reply_quote: None,
-                        edited: false,
-                    };
-                    let chunks = render::render(&text);
-                    for url in targets {
-                        spawn_text(
-                            deliverer.clone(),
-                            ops.clone(),
-                            url.clone(),
-                            username.clone(),
-                            chunks.clone(),
-                        );
+                for (name, url) in resolve_targets_named(route, &snapshot.webhooks) {
+                    if seen.insert(name.0.clone()) {
+                        targets.push(MediaTarget {
+                            route: route.name.clone(),
+                            webhook: name,
+                            url,
+                        });
                     }
                 }
+            }
+            if targets.is_empty() {
+                return;
+            }
+            let title = title.unwrap_or_else(|| targets[0].route.clone());
+
+            // Oversized or placeholder mode: relay a rich embed carrying the
+            // caption + a notice + the deep link (no file), recorded like any
+            // other post so it dedups across restarts and the refresh worker
+            // keeps its stats live.
+            let oversized = approx_size > snapshot.media.max_bytes;
+            if oversized || snapshot.media.mode == MediaMode::Placeholder {
+                let notice = if oversized {
+                    "[media too large to relay]"
+                } else {
+                    "[media]"
+                };
+                let body = if caption.trim().is_empty() {
+                    notice.to_string()
+                } else {
+                    format!("{caption}\n{notice}")
+                };
+                let hash = content_hash(&caption);
+                let text = RelayText {
+                    sender: None,
+                    body,
+                    reply_quote: None,
+                    edited: false,
+                };
+                let meta = EmbedMeta {
+                    title,
+                    avatar_url: None,
+                    deep_link: deep_link.clone(),
+                    reactions: Default::default(),
+                    comment_count: 0,
+                    deleted: false,
+                };
+                let embeds = render::embed(&text, &meta);
+                for t in targets {
+                    let username = display_name(sender.as_deref(), &t.route);
+                    spawn_embed(
+                        deliverer.clone(),
+                        ops.clone(),
+                        store.clone(),
+                        t.url,
+                        NewRecord {
+                            chat_id: chat.0,
+                            tg_msg_id: msg_id,
+                            route: t.route,
+                            webhook_name: t.webhook.0,
+                            discord_msg_id: String::new(),
+                            content_hash: hash.clone(),
+                            reactions: Default::default(),
+                            comment_count: 0,
+                        },
+                        username,
+                        embeds.clone(),
+                    );
+                }
                 return;
             }
 
-            // Precompute owned routing data (username + targets) per matching
-            // route so the download task needs nothing borrowed from the loop.
-            let route_items: Vec<(String, Vec<WebhookUrl>)> = wanted
-                .into_iter()
-                .map(|(route, targets)| (display_name(sender.as_deref(), &route.name), targets))
-                .collect();
-
-            // Move the download OFF the hot path: spawn a task that downloads,
-            // builds one MediaItem per route, and hands each back over the
-            // channel. handle_update never awaits the download, so text
-            // delivery, timers, and shutdown are never blocked by it.
+            // Downloadable: move the download OFF the hot path. One MediaItem
+            // per message, carrying the full target list + embed metadata; the
+            // album buffer coalesces siblings and flush_album posts ONE rich
+            // embed with all files per distinct target.
             let client = client.clone();
             let media_tx = media_tx.clone();
             let ops = ops.clone();
@@ -865,32 +994,24 @@ async fn handle_update(
                     }
                 };
                 let filename = media_filename(&media, msg_id);
-
-                // One MediaItem per matching route (each carries its own
-                // targets); only the first route's item keeps the caption to
-                // avoid duplicate caption posts across fan-out.
-                for (i, (username, targets)) in route_items.into_iter().enumerate() {
-                    let item = MediaItem {
-                        grouped_id,
-                        msg_id,
-                        chat,
-                        username,
-                        filename: filename.clone(),
-                        bytes: bytes.clone(),
-                        caption: if i == 0 {
-                            caption.clone()
-                        } else {
-                            String::new()
-                        },
-                        targets,
-                    };
-                    // Never block the download task on a full channel: on
-                    // full/closed, log and post a rate-limited ops drop notice.
-                    if let Err(e) = media_tx.try_send(item) {
-                        warn!(error = %e, msg_id, "media channel send failed; dropping item");
-                        ops.drop_notice(&format!("media dropped (msg {msg_id}): channel {e}"))
-                            .await;
-                    }
+                let item = MediaItem {
+                    grouped_id,
+                    msg_id,
+                    chat,
+                    filename,
+                    bytes,
+                    caption,
+                    deep_link,
+                    title,
+                    sender,
+                    targets,
+                };
+                // Never block the download task on a full channel: on
+                // full/closed, log and post a rate-limited ops drop notice.
+                if let Err(e) = media_tx.try_send(item) {
+                    warn!(error = %e, msg_id, "media channel send failed; dropping item");
+                    ops.drop_notice(&format!("media dropped (msg {msg_id}): channel {e}"))
+                        .await;
                 }
             });
         }
@@ -945,83 +1066,204 @@ fn spawn_embed(
     });
 }
 
-/// Spawn a fire-and-forget text delivery, reporting drops to ops.
-fn spawn_text(
-    deliverer: Arc<Deliverer>,
-    ops: Ops,
-    url: WebhookUrl,
-    username: String,
-    chunks: Vec<String>,
-) {
-    tokio::spawn(async move {
-        if let Outcome::Dropped { reason } = deliverer.post_text(&url, &username, &chunks).await {
-            warn!(%reason, "text delivery dropped");
-            ops.drop_notice(&format!("delivery dropped: {reason}"))
-                .await;
-        }
-    });
-}
-
-/// Post an album batch: optional caption text first, then each file, per target.
-async fn flush_album(deliverer: &Deliverer, ops: &Ops, mut batch: Vec<MediaItem>) {
-    // Sort by msg_id to ensure album items are posted in canonical order.
-    // Concurrent downloads may complete out of order; sorting guarantees the
-    // caption (which rides on the first item) is paired with the correct msg_id.
-    sort_album_batch(&mut batch);
-
-    let Some(first) = batch.first() else {
+/// Flush an album (or a single ungrouped media item) as ONE rich-embed message
+/// per distinct target: the caption embed plus every file, recorded to the store
+/// so the refresh worker keeps it live and restart/backfill dedup works.
+///
+/// Two coupled de-duplications fix the old fan-out bugs: files are deduped by
+/// `msg_id` (each physical photo uploaded once) and targets are the deduped
+/// union across all items (every webhook any matching route selected gets the
+/// album exactly once, instead of everything going to the first item's targets).
+async fn flush_album(deliverer: &Deliverer, ops: &Ops, store: &Store, batch: Vec<MediaItem>) {
+    let Some(album) = coalesce_album(batch) else {
         return;
     };
-    for target in &first.targets {
-        if !first.caption.is_empty() {
-            let text = RelayText {
-                sender: None,
-                body: first.caption.clone(),
-                reply_quote: None,
-                edited: false,
-            };
-            let chunks = render::render(&text);
-            if let Outcome::Dropped { reason } =
-                deliverer.post_text(target, &first.username, &chunks).await
-            {
-                warn!(%reason, "album caption dropped");
-                ops.drop_notice(&format!("album caption dropped: {reason}"))
-                    .await;
-            }
+    // Live posts have no reactions/comments yet; the refresh worker fills them.
+    deliver_coalesced_media(
+        deliverer,
+        store,
+        Some(ops),
+        album.chat_id,
+        album.anchor_msg_id,
+        &album.title,
+        &album.caption,
+        album.deep_link.as_deref(),
+        album.sender.as_deref(),
+        &std::collections::BTreeMap::new(),
+        0,
+        &album.files,
+        &album.targets,
+    )
+    .await;
+}
+
+/// The pure result of coalescing an album batch: the deduped files, the anchor
+/// (caption-bearing) message identity, and the deduped union of fan-out targets.
+struct CoalescedAlbum {
+    chat_id: i64,
+    anchor_msg_id: i32,
+    title: String,
+    caption: String,
+    deep_link: Option<String>,
+    sender: Option<String>,
+    files: Vec<(String, Vec<u8>)>,
+    targets: Vec<MediaTarget>,
+}
+
+/// Coalesce an album batch into a single message's worth of data (pure; no I/O).
+///
+/// Two de-duplications fix the old fan-out bugs: files are deduped by `msg_id`
+/// (each physical photo uploaded once) and targets are the deduped union across
+/// every item (every webhook any matching route selected gets the album exactly
+/// once, instead of everything going to the first item's targets). Returns
+/// `None` for an empty batch.
+fn coalesce_album(mut batch: Vec<MediaItem>) -> Option<CoalescedAlbum> {
+    // Canonical album order; also pairs the caption with the lowest msg_id.
+    sort_album_batch(&mut batch);
+    if batch.is_empty() {
+        return None;
+    }
+
+    // De-duplicate files by msg_id (each physical photo once), preserving order.
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut seen_ids: HashSet<i32> = HashSet::new();
+    for it in &batch {
+        if seen_ids.insert(it.msg_id) {
+            files.push((it.filename.clone(), it.bytes.clone()));
         }
-        for item in &batch {
-            if let Outcome::Dropped { reason } = deliverer
-                .post_file(target, &item.username, &item.filename, item.bytes.clone())
-                .await
-            {
-                warn!(%reason, filename = %item.filename, "media upload dropped");
-                ops.drop_notice(&format!("media upload dropped: {reason}"))
-                    .await;
+    }
+
+    // Anchor = the caption-bearing message (its msg_id keys the store row +
+    // content hash); fall back to the lowest msg_id for a captionless album.
+    let (anchor_msg_id, caption, deep_link) = batch
+        .iter()
+        .find(|i| !i.caption.trim().is_empty())
+        .map(|i| (i.msg_id, i.caption.clone(), i.deep_link.clone()))
+        .unwrap_or_else(|| (batch[0].msg_id, String::new(), batch[0].deep_link.clone()));
+
+    // Union of distinct targets across every item, deduped by webhook name.
+    let mut targets: Vec<MediaTarget> = Vec::new();
+    let mut seen_hooks: HashSet<String> = HashSet::new();
+    for it in &batch {
+        for t in &it.targets {
+            if seen_hooks.insert(t.webhook.0.clone()) {
+                targets.push(t.clone());
             }
         }
     }
+
+    Some(CoalescedAlbum {
+        chat_id: batch[0].chat.0,
+        anchor_msg_id,
+        title: batch[0].title.clone(),
+        caption,
+        deep_link,
+        sender: batch[0].sender.clone(),
+        files,
+        targets,
+    })
 }
 
-/// Resolve a route's webhook names into concrete URLs against the snapshot map.
-fn resolve_targets(
-    route: &ResolvedRoute,
-    webhooks: &HashMap<WebhookName, WebhookUrl>,
-) -> Vec<WebhookUrl> {
-    route
-        .to
-        .iter()
-        .filter_map(|name| {
-            let url = webhooks.get(name).cloned();
-            if url.is_none() {
-                warn!(webhook = %name.0, route = %route.name, "route references unknown webhook");
+/// Post one coalesced media message — a rich embed plus every attached file — to
+/// each distinct target, recording each delivery. Shared by the live album flush
+/// and `backfill` so their media rendering + store tracking are identical.
+///
+/// Reactions/comment counts start empty; the refresh worker fills them in on its
+/// next tick (and PATCHes the embed in place, leaving the attachments intact).
+/// Returns `(posted, dropped, skipped_dupe)` for the caller's counters.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_coalesced_media(
+    deliverer: &Deliverer,
+    store: &Store,
+    ops: Option<&Ops>,
+    chat_id: i64,
+    anchor_msg_id: i32,
+    title: &str,
+    caption: &str,
+    deep_link: Option<&str>,
+    sender: Option<&str>,
+    reactions: &std::collections::BTreeMap<String, i32>,
+    comment_count: i32,
+    files: &[(String, Vec<u8>)],
+    targets: &[MediaTarget],
+) -> (usize, usize, usize) {
+    // The embed is identical for every target (only the webhook username, passed
+    // separately to post_media_embed, varies), so build it once.
+    let text = RelayText {
+        sender: None,
+        body: caption.to_string(),
+        reply_quote: None,
+        edited: false,
+    };
+    let meta = EmbedMeta {
+        title: title.to_string(),
+        avatar_url: None,
+        deep_link: deep_link.map(|s| s.to_string()),
+        reactions: reactions.clone(),
+        comment_count,
+        deleted: false,
+    };
+    let embeds = render::embed(&text, &meta);
+    // Hash the RAW caption: the refresh worker recomputes the hash from the
+    // anchor message's text alone, so this matches and avoids a spurious edit.
+    let hash = content_hash(caption);
+
+    let (mut posted, mut dropped, mut skipped) = (0usize, 0usize, 0usize);
+    for t in targets {
+        match store.already_relayed(chat_id, anchor_msg_id, &t.webhook.0) {
+            Ok(true) => {
+                info!(
+                    chat = chat_id,
+                    msg_id = anchor_msg_id,
+                    webhook = %t.webhook.0,
+                    "media already relayed (store); skipping"
+                );
+                skipped += 1;
+                continue;
             }
-            url
-        })
-        .collect()
+            Ok(false) => {}
+            Err(e) => {
+                warn!(error = %e, chat = chat_id, msg_id = anchor_msg_id, "media dedup check failed; posting anyway")
+            }
+        }
+
+        let username = display_name(sender, &t.route);
+        match deliverer
+            .post_media_embed(&t.url, &username, &embeds, files.to_vec())
+            .await
+        {
+            PostResult::Delivered { discord_msg_id } => {
+                let record = NewRecord {
+                    chat_id,
+                    tg_msg_id: anchor_msg_id,
+                    route: t.route.clone(),
+                    webhook_name: t.webhook.0.clone(),
+                    discord_msg_id,
+                    content_hash: hash.clone(),
+                    reactions: reactions.clone(),
+                    comment_count,
+                };
+                if let Err(e) = store.record(record) {
+                    warn!(error = %e, "failed to record relayed media");
+                }
+                posted += 1;
+            }
+            PostResult::Dropped { reason } => {
+                warn!(%reason, chat = chat_id, msg_id = anchor_msg_id, webhook = %t.webhook.0, "media delivery dropped");
+                if let Some(ops) = ops {
+                    ops.drop_notice(&format!("media delivery dropped: {reason}"))
+                        .await;
+                }
+                dropped += 1;
+            }
+        }
+    }
+    (posted, dropped, skipped)
 }
 
-/// Like [`resolve_targets`] but also returns each webhook's name, needed to
-/// record which webhook a message was posted to for later PATCHing.
+/// Resolve a route's webhook names into concrete `(name, url)` pairs against the
+/// snapshot map. The name is kept so a delivery can be recorded (for dedup +
+/// PATCHing) under the webhook it was posted to.
 fn resolve_targets_named(
     route: &ResolvedRoute,
     webhooks: &HashMap<WebhookName, WebhookUrl>,
@@ -1112,5 +1354,95 @@ mod backfill_tests {
             clamp_backfill_count(telegram_relay::cli::BACKFILL_MAX_COUNT + 100),
             telegram_relay::cli::BACKFILL_MAX_COUNT
         );
+    }
+}
+
+#[cfg(test)]
+mod album_coalesce_tests {
+    use super::*;
+    use telegram_relay::config::ChatId;
+
+    fn media_item(msg_id: i32, caption: &str, hooks: &[&str]) -> MediaItem {
+        MediaItem {
+            grouped_id: Some(42),
+            msg_id,
+            chat: ChatId(-100),
+            filename: format!("photo_{msg_id}.jpg"),
+            bytes: format!("bytes-{msg_id}").into_bytes(),
+            caption: caption.to_string(),
+            deep_link: Some(format!("https://t.me/c/{msg_id}")),
+            title: "Rob's Channel".into(),
+            sender: None,
+            targets: hooks
+                .iter()
+                .map(|h| MediaTarget {
+                    route: "r1".into(),
+                    webhook: WebhookName(h.to_string()),
+                    url: WebhookUrl(format!("https://discord.example/{h}")),
+                })
+                .collect(),
+        }
+    }
+
+    fn hook_names(album: &CoalescedAlbum) -> Vec<&str> {
+        album.targets.iter().map(|t| t.webhook.0.as_str()).collect()
+    }
+
+    fn file_names(album: &CoalescedAlbum) -> Vec<String> {
+        album.files.iter().map(|f| f.0.clone()).collect()
+    }
+
+    #[test]
+    fn dedups_files_by_msgid_and_unions_targets() {
+        // An album of two photos where each item carries the FULL target set
+        // [alpha, beta] — mirroring the live path where every photo fans out to
+        // both webhooks. The old bug uploaded every file per item and only to
+        // the first item's targets; coalescing must yield 2 files delivered to
+        // each of the 2 distinct targets exactly once.
+        let batch = vec![
+            media_item(101, "album caption", &["alpha", "beta"]),
+            media_item(102, "", &["alpha", "beta"]),
+        ];
+        let album = coalesce_album(batch).expect("non-empty batch");
+        assert_eq!(file_names(&album), vec!["photo_101.jpg", "photo_102.jpg"]);
+        assert_eq!(hook_names(&album), vec!["alpha", "beta"]);
+        assert_eq!(album.caption, "album caption");
+        assert_eq!(album.anchor_msg_id, 101);
+    }
+
+    #[test]
+    fn orders_files_by_msgid_and_anchors_on_caption() {
+        // Downloads complete out of order and the caption rides a later msg_id:
+        // files still sort by msg_id, and the anchor follows the caption.
+        let batch = vec![
+            media_item(203, "", &["alpha"]),
+            media_item(201, "", &["alpha"]),
+            media_item(202, "the caption", &["alpha"]),
+        ];
+        let album = coalesce_album(batch).expect("non-empty batch");
+        assert_eq!(
+            file_names(&album),
+            vec!["photo_201.jpg", "photo_202.jpg", "photo_203.jpg"]
+        );
+        assert_eq!(album.anchor_msg_id, 202);
+        assert_eq!(album.caption, "the caption");
+    }
+
+    #[test]
+    fn dedups_repeated_msgid_and_unions_split_targets() {
+        // The same physical photo appears twice (as it did pre-union, once per
+        // route) but with different webhooks: one file, unioned targets.
+        let batch = vec![
+            media_item(301, "cap", &["alpha"]),
+            media_item(301, "cap", &["beta"]),
+        ];
+        let album = coalesce_album(batch).expect("non-empty batch");
+        assert_eq!(album.files.len(), 1);
+        assert_eq!(hook_names(&album), vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn empty_batch_is_none() {
+        assert!(coalesce_album(vec![]).is_none());
     }
 }

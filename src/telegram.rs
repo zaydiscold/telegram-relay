@@ -289,6 +289,8 @@ pub enum Incoming {
         sender: Option<String>,
         approx_size: u64,
         deep_link: Option<String>,
+        /// Channel/chat title, for the embed author (same as the text path).
+        title: Option<String>,
     },
 }
 
@@ -563,6 +565,7 @@ pub fn classify(update: Update) -> Option<Incoming> {
                 sender,
                 approx_size,
                 deep_link,
+                title,
             })
         }
     }

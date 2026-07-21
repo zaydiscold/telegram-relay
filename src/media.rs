@@ -17,27 +17,50 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use crate::config::{ChatId, WebhookUrl};
+use crate::config::{ChatId, WebhookName, WebhookUrl};
+
+/// A resolved fan-out target for a media post: which route selected it and the
+/// named webhook to deliver to. The webhook *name* is required so the post can
+/// be recorded in the store (keyed on webhook name) for dedup + refresh.
+#[derive(Clone)]
+pub struct MediaTarget {
+    /// Route name that selected this webhook (store record + display username).
+    pub route: String,
+    /// Webhook name — the store dedup/refresh key.
+    pub webhook: WebhookName,
+    /// Resolved webhook URL.
+    pub url: WebhookUrl,
+}
 
 /// One downloaded media file ready to post, with its routing/context attached.
+///
+/// An album (media group) arrives as several of these sharing `grouped_id`;
+/// [`AlbumBuffer`] coalesces them so a single Discord message carries every
+/// file. Each item carries the *full* fan-out target list (deduped by webhook
+/// at flush time) plus the embed metadata (`title`, `caption`, `deep_link`), so
+/// the media post renders as a rich embed identical to the text path.
 #[derive(Clone)]
 pub struct MediaItem {
     /// Album id, if this file is part of a media group.
     pub grouped_id: Option<i64>,
-    /// Telegram message id (for ordering / dedup context).
+    /// Telegram message id (ordering / dedup / per-file de-duplication).
     pub msg_id: i32,
     /// Source chat.
     pub chat: ChatId,
-    /// Display name to show as the Discord webhook username.
-    pub username: String,
     /// Filename to present on the uploaded attachment.
     pub filename: String,
     /// The already-downloaded file bytes.
     pub bytes: Vec<u8>,
-    /// Caption text (usually only the first item of an album carries one).
+    /// Caption text (only the caption-bearing message of an album has one).
     pub caption: String,
-    /// Resolved Discord webhook URLs this item should be posted to.
-    pub targets: Vec<WebhookUrl>,
+    /// t.me deep link to this message, if the chat has a public username.
+    pub deep_link: Option<String>,
+    /// Channel/chat title for the embed author.
+    pub title: String,
+    /// Message sender display name, if any (for the webhook username).
+    pub sender: Option<String>,
+    /// Distinct routes×webhooks this album should fan out to.
+    pub targets: Vec<MediaTarget>,
 }
 
 /// Coalesces album (media-group) siblings into a single batch.
@@ -125,11 +148,17 @@ mod tests {
             grouped_id,
             msg_id,
             chat: ChatId(1),
-            username: "tester".into(),
             filename: format!("f{msg_id}.bin"),
             bytes: vec![0u8, 1, 2, 3],
             caption: String::new(),
-            targets: vec![WebhookUrl("https://example.invalid/webhook".into())],
+            deep_link: None,
+            title: "tester".into(),
+            sender: None,
+            targets: vec![MediaTarget {
+                route: "r1".into(),
+                webhook: WebhookName("hook".into()),
+                url: WebhookUrl("https://example.invalid/webhook".into()),
+            }],
         }
     }
 
