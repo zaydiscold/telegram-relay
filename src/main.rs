@@ -772,6 +772,8 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
         info!(
             interval_mins = cfg.refresh.interval_mins,
             horizon_hours = cfg.refresh.horizon_hours,
+            reaction_horizon_mins = cfg.refresh.reaction_horizon_mins,
+            reaction_early_check_secs = cfg.refresh.reaction_early_check_secs,
             "refresh worker started"
         );
     }

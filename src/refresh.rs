@@ -155,6 +155,70 @@ impl PostFetcher for GrammersFetcher {
     }
 }
 
+/// Current Unix time in seconds (relay clock — same basis as the store's
+/// `posted_at`/`last_checked`).
+fn now_secs() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Per-row refresh decision, derived purely from timing + config.
+///
+/// Splits the two cadences (queued-polish §1): edits/deletes are re-checked on
+/// the `interval_mins` cadence for the whole horizon, while reactions/comments
+/// are checked only at a few early checkpoints and then frozen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshDecision {
+    /// Re-fetch this row from Telegram this tick.
+    pub fetch: bool,
+    /// If fetched, a reaction/comment change may be applied (the post is still
+    /// within the reaction horizon). Edits/deletes are always applied when
+    /// fetched (the caller only fetches rows still inside the edit/delete
+    /// horizon, which `Store::due` already enforces).
+    pub allow_stats: bool,
+}
+
+/// Decide whether (and how) to refresh one row this tick, from its age, the time
+/// since its last check, and its age at that last check.
+///
+/// A **reaction check** is due when the post is still inside the reaction horizon
+/// AND age has just crossed one of the reaction checkpoints
+/// (`reaction_early_check_secs`, `interval_mins`, `reaction_horizon_mins`) that
+/// the last check had not yet passed — so each checkpoint fires exactly once as
+/// age grows. An **edit/delete check** is due every `interval_mins` (measured
+/// from the last check). Either makes the row worth fetching; a single fetch
+/// answers both. Reaction/comment changes are only *applied* while inside the
+/// reaction horizon (`allow_stats`).
+pub fn decide_refresh(
+    age_secs: i64,
+    since_checked_secs: i64,
+    last_checked_age_secs: i64,
+    cfg: &RefreshCfg,
+) -> RefreshDecision {
+    let interval = (cfg.interval_mins * 60) as i64;
+    let reaction_horizon = (cfg.reaction_horizon_mins * 60) as i64;
+    let early = cfg.reaction_early_check_secs as i64;
+
+    // Reaction checkpoints, relative to the post's age. A checkpoint C fires when
+    // last_checked_age < C <= age (age just crossed it since the last check).
+    let checkpoints = [early, interval, reaction_horizon];
+    let reaction_due = age_secs <= reaction_horizon
+        && checkpoints
+            .iter()
+            .any(|&c| last_checked_age_secs < c && c <= age_secs);
+
+    // Edit/delete cadence: every `interval` since the last check.
+    let edit_due = since_checked_secs >= interval;
+
+    RefreshDecision {
+        fetch: reaction_due || edit_due,
+        allow_stats: age_secs <= reaction_horizon,
+    }
+}
+
 /// The change detected between a stored row and its re-fetched source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshAction {
@@ -228,6 +292,17 @@ pub fn color_for(colors: &RouteColors, route: &str) -> u32 {
         .unwrap_or(render::DEFAULT_EMBED_COLOR)
 }
 
+/// The base worker tick.
+///
+/// It runs at the reaction early-check granularity (default 60s, capped) rather
+/// than the 30-min edit interval, so the "+1 min" reaction checkpoint can be
+/// honored. Each tick is cheap: per-row gating in [`tick_once`] fetches only the
+/// rows whose cadence is actually due, so a fast tick does NOT mean fast
+/// Telegram polling (queued-polish §1).
+fn base_tick_secs(cfg: &RefreshCfg) -> u64 {
+    cfg.reaction_early_check_secs.clamp(1, 60)
+}
+
 /// The interval worker. Runs until the process ends.
 pub async fn run<F: PostFetcher>(
     fetcher: F,
@@ -237,7 +312,7 @@ pub async fn run<F: PostFetcher>(
     colors: RouteColors,
     cfg: RefreshCfg,
 ) {
-    let mut ticker = tokio::time::interval(Duration::from_secs(cfg.interval_mins * 60));
+    let mut ticker = tokio::time::interval(Duration::from_secs(base_tick_secs(&cfg)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // First tick fires immediately; skip it so we don't refresh before anything
     // has been posted.
@@ -271,9 +346,30 @@ pub async fn tick_once<F: PostFetcher>(
         by_chat.entry(t.chat_id).or_default().push(t);
     }
 
+    let now = now_secs();
     for (chat_id, rows) in by_chat {
-        // Unique tg ids for this chat, batched at BATCH_MAX.
-        let mut ids: Vec<i32> = rows.iter().map(|r| r.tg_msg_id).collect();
+        // Per-row cadence gate: decide which rows are actually due this tick, so
+        // a fast base tick does not translate into fast Telegram polling.
+        let decisions: Vec<RefreshDecision> = rows
+            .iter()
+            .map(|r| {
+                let age = now - r.posted_at;
+                let since_checked = now - r.last_checked;
+                let last_checked_age = r.last_checked - r.posted_at;
+                decide_refresh(age, since_checked, last_checked_age, cfg)
+            })
+            .collect();
+
+        // Unique tg ids that want a fetch this tick, batched at BATCH_MAX.
+        let mut ids: Vec<i32> = rows
+            .iter()
+            .zip(&decisions)
+            .filter(|(_, d)| d.fetch)
+            .map(|(r, _)| r.tg_msg_id)
+            .collect();
+        if ids.is_empty() {
+            continue; // nothing due for this chat this tick
+        }
         ids.sort_unstable();
         ids.dedup();
 
@@ -294,15 +390,33 @@ pub async fn tick_once<F: PostFetcher>(
             continue; // fetch failed entirely for this chat
         }
 
-        for row in rows {
+        for (row, decision) in rows.iter().zip(&decisions) {
+            if !decision.fetch {
+                continue; // not due this tick
+            }
             // If the id wasn't in any successful batch, don't guess it's deleted.
             let Some(slot) = fetched.get(&row.tg_msg_id) else {
                 continue;
             };
-            let action = diff(&row, slot.as_ref());
+            let mut action = diff(row, slot.as_ref());
+            // Freeze reaction/comment updates past the reaction horizon; edits
+            // and deletes still apply for the full edit/delete horizon.
+            if action == RefreshAction::StatsChanged && !decision.allow_stats {
+                action = RefreshAction::None;
+            }
+            if action == RefreshAction::None {
+                // Fetched but nothing to PATCH: still advance last_checked so the
+                // cadence gate progresses (otherwise a checkpoint re-fires every
+                // base tick).
+                if let Err(e) = store.touch_checked(row.chat_id, row.tg_msg_id, &row.discord_msg_id)
+                {
+                    warn!(chat_id, tg = row.tg_msg_id, error = %e, "touch_checked failed");
+                }
+                continue;
+            }
             if let Err(e) = apply(
                 &action,
-                &row,
+                row,
                 slot.as_ref(),
                 store,
                 deliverer,
@@ -441,6 +555,8 @@ mod tests {
             content_hash: content_hash(body),
             reactions: map(reactions),
             comment_count: comments,
+            posted_at: 0,
+            last_checked: 0,
         }
     }
 
@@ -509,6 +625,94 @@ mod tests {
     fn content_hash_is_stable_and_distinct() {
         assert_eq!(content_hash("abc"), content_hash("abc"));
         assert_ne!(content_hash("abc"), content_hash("abd"));
+    }
+
+    // ---- decide_refresh cadence gate (queued-polish §1) ----
+    // Defaults: interval 30m=1800s, reaction_horizon 60m=3600s, early 60s.
+
+    fn cadence_cfg() -> RefreshCfg {
+        RefreshCfg::default()
+    }
+
+    #[test]
+    fn early_reaction_checkpoint_fires_at_one_minute() {
+        // Fresh post, first evaluated at +60s: the early checkpoint fires.
+        let cfg = cadence_cfg();
+        let d = decide_refresh(60, 60, 0, &cfg);
+        assert!(d.fetch, "the +1min reaction check must fire");
+        assert!(d.allow_stats);
+    }
+
+    #[test]
+    fn no_fetch_between_checkpoints() {
+        // Checked at +60s (last_checked_age = 60); now +120s. No checkpoint has
+        // been crossed and the 30-min edit cadence hasn't elapsed -> no fetch.
+        let cfg = cadence_cfg();
+        let d = decide_refresh(120, 60, 60, &cfg);
+        assert!(!d.fetch, "should not poll Telegram between checkpoints");
+    }
+
+    #[test]
+    fn interval_checkpoint_fires_at_thirty_minutes() {
+        // Last checked at +60s; now +30min. The interval checkpoint (1800s) has
+        // just been crossed -> fetch, and reactions still apply (<= horizon).
+        let cfg = cadence_cfg();
+        let d = decide_refresh(1800, 1800 - 60, 60, &cfg);
+        assert!(d.fetch);
+        assert!(d.allow_stats);
+    }
+
+    #[test]
+    fn reaction_horizon_checkpoint_fires_at_sixty_minutes() {
+        // Last checked at +30min; now +60min: the reaction-horizon checkpoint
+        // fires and the 30-min edit cadence is also due. Still within horizon.
+        let cfg = cadence_cfg();
+        let d = decide_refresh(3600, 1800, 1800, &cfg);
+        assert!(d.fetch);
+        assert!(d.allow_stats, "age == horizon is still inside the horizon");
+    }
+
+    #[test]
+    fn past_reaction_horizon_still_checks_edits_but_freezes_stats() {
+        // +90min, last checked +60min: the edit cadence fires (fetch), but the
+        // post is past the reaction horizon so reaction/comment stats are frozen.
+        let cfg = cadence_cfg();
+        let d = decide_refresh(5400, 1800, 3600, &cfg);
+        assert!(d.fetch, "edits/deletes still checked every 30 min");
+        assert!(!d.allow_stats, "reactions frozen past the 1h horizon");
+    }
+
+    #[test]
+    fn edit_cadence_recurs_every_interval_far_past_reaction_horizon() {
+        // Deep into the 48h horizon: no reaction checkpoint remains, but the edit
+        // cadence keeps firing every 30 min and stats stay frozen.
+        let cfg = cadence_cfg();
+        // 10h old, last checked 30min ago.
+        let age = 10 * 3600;
+        let d = decide_refresh(age, 1800, age - 1800, &cfg);
+        assert!(d.fetch);
+        assert!(!d.allow_stats);
+        // ...but only just short of the interval -> no fetch yet.
+        let d2 = decide_refresh(age, 1799, age - 1799, &cfg);
+        assert!(!d2.fetch);
+    }
+
+    #[test]
+    fn allow_stats_boundary_is_inclusive() {
+        let cfg = cadence_cfg();
+        assert!(decide_refresh(3600, 3600, 0, &cfg).allow_stats);
+        assert!(!decide_refresh(3601, 3601, 0, &cfg).allow_stats);
+    }
+
+    #[test]
+    fn each_reaction_checkpoint_fires_at_most_once() {
+        // Once the early checkpoint has been consumed (last_checked_age just past
+        // it), re-evaluating at a slightly larger age does NOT re-fire it.
+        let cfg = cadence_cfg();
+        // age 65s, last checked at 61s (already past the 60s early checkpoint),
+        // 30-min cadence not elapsed -> no fetch.
+        let d = decide_refresh(65, 4, 61, &cfg);
+        assert!(!d.fetch, "a consumed checkpoint must not re-fire");
     }
 
     #[test]

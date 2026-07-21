@@ -102,6 +102,13 @@ pub struct TrackedMsg {
     pub content_hash: String,
     pub reactions: BTreeMap<String, i32>,
     pub comment_count: i32,
+    /// Unix seconds when this row was first recorded (relay time). Drives the
+    /// per-data-type refresh cadence (queued-polish §1) — post age = now -
+    /// posted_at.
+    pub posted_at: i64,
+    /// Unix seconds of the last refresh check on this row. Advances on every
+    /// evaluated tick (even a no-change one) so the cadence gate progresses.
+    pub last_checked: i64,
 }
 
 /// Serialize a reactions map to the JSON stored in the `reactions` column.
@@ -307,7 +314,7 @@ impl Store {
         let mut stmt = conn.prepare(
             r#"
             SELECT chat_id, tg_msg_id, route, webhook_name, discord_msg_id,
-                   content_hash, reactions, comment_count
+                   content_hash, reactions, comment_count, posted_at, last_checked
             FROM relayed
             WHERE deleted = 0 AND posted_at >= ?1
             ORDER BY chat_id, tg_msg_id
@@ -323,6 +330,8 @@ impl Store {
                 content_hash: r.get(5)?,
                 reactions: reactions_from_json(&r.get::<_, String>(6)?),
                 comment_count: r.get(7)?,
+                posted_at: r.get(8)?,
+                last_checked: r.get(9)?,
             })
         })?;
         let mut out = Vec::new();
@@ -361,6 +370,23 @@ impl Store {
             ],
         )
         .context("updating stats")?;
+        Ok(())
+    }
+
+    /// Bump `last_checked` on one row without changing its stats.
+    ///
+    /// Called when the refresh worker fetched a row but found no change: the
+    /// cadence gate (queued-polish §1) keys off `last_checked`, so it must
+    /// advance on every evaluated tick, not only on ticks that PATCH something —
+    /// otherwise a checkpoint would re-fire every base tick.
+    pub fn touch_checked(&self, chat_id: i64, tg_msg_id: i32, discord_msg_id: &str) -> Result<()> {
+        let now = now_secs();
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.execute(
+            "UPDATE relayed SET last_checked = ?4 WHERE chat_id = ?1 AND tg_msg_id = ?2 AND discord_msg_id = ?3",
+            rusqlite::params![chat_id, tg_msg_id, discord_msg_id, now],
+        )
+        .context("touching last_checked")?;
         Ok(())
     }
 
@@ -652,6 +678,40 @@ mod tests {
         store.record(rec(1, 1, "d-a")).unwrap(); // route "r1" per rec()
         let due = store.due(48).unwrap();
         assert_eq!(due[0].route, "r1");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn due_carries_posted_at_and_last_checked() {
+        let path = tmp_db("due-timing");
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).unwrap();
+        store.record(rec(1, 1, "d-a")).unwrap();
+        let due = store.due(48).unwrap();
+        // Freshly recorded: posted_at == last_checked and both are set.
+        assert!(due[0].posted_at > 0);
+        assert_eq!(due[0].posted_at, due[0].last_checked);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn touch_checked_advances_last_checked_only() {
+        let path = tmp_db("touch");
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).unwrap();
+        store.record(rec(1, 1, "d-a")).unwrap();
+        let before = store.due(48).unwrap().into_iter().next().unwrap();
+        // Backdate posted_at + last_checked so the touch's `now` is strictly later.
+        store.backdate_all(120);
+        store.touch_checked(1, 1, "d-a").unwrap();
+        let after = store.due(48).unwrap().into_iter().next().unwrap();
+        assert!(
+            after.last_checked > before.last_checked - 120,
+            "last_checked should advance to ~now"
+        );
+        // Stats untouched.
+        assert_eq!(after.content_hash, before.content_hash);
+        assert_eq!(after.reactions, before.reactions);
         let _ = std::fs::remove_file(&path);
     }
 

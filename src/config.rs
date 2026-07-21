@@ -69,10 +69,22 @@ pub struct MediaCfg {
 }
 
 /// Refresh-worker cadence + how far back to keep updating posts.
+///
+/// Two concerns run on different schedules (queued-polish §1):
+/// * **edits + deletes** — checked every `interval_mins` for `horizon_hours`
+///   (the most pertinent changes; kept for the full 48h horizon).
+/// * **reactions + comments** — QoL only, so checked a few times early
+///   (~`reaction_early_check_secs`, then at `interval_mins` and again at
+///   `reaction_horizon_mins`) and then frozen once the post ages past
+///   `reaction_horizon_mins`.
 #[derive(Debug, Clone, Copy)]
 pub struct RefreshCfg {
     pub interval_mins: u64,
     pub horizon_hours: u64,
+    /// Stop refreshing reactions/comments once a post is older than this.
+    pub reaction_horizon_mins: u64,
+    /// The early ("+1 min") reaction burst check, in seconds after posting.
+    pub reaction_early_check_secs: u64,
 }
 
 impl Default for RefreshCfg {
@@ -80,6 +92,8 @@ impl Default for RefreshCfg {
         RefreshCfg {
             interval_mins: 30,
             horizon_hours: 48,
+            reaction_horizon_mins: 60,
+            reaction_early_check_secs: 60,
         }
     }
 }
@@ -152,12 +166,22 @@ mod raw {
         pub interval_mins: u64,
         #[serde(default = "default_horizon_hours")]
         pub horizon_hours: u64,
+        #[serde(default = "default_reaction_horizon_mins")]
+        pub reaction_horizon_mins: u64,
+        #[serde(default = "default_reaction_early_check_secs")]
+        pub reaction_early_check_secs: u64,
     }
     fn default_interval_mins() -> u64 {
         30
     }
     fn default_horizon_hours() -> u64 {
         48
+    }
+    fn default_reaction_horizon_mins() -> u64 {
+        60
+    }
+    fn default_reaction_early_check_secs() -> u64 {
+        60
     }
     #[derive(Deserialize)]
     pub struct Store {
@@ -286,6 +310,8 @@ impl Config {
             .map_or_else(RefreshCfg::default, |r| RefreshCfg {
                 interval_mins: r.interval_mins,
                 horizon_hours: r.horizon_hours,
+                reaction_horizon_mins: r.reaction_horizon_mins,
+                reaction_early_check_secs: r.reaction_early_check_secs,
             });
         let store = raw.store.map_or_else(StoreCfg::default, |s| StoreCfg {
             path: PathBuf::from(s.path),
@@ -337,7 +363,25 @@ mod tests {
         let c = Config::load(&p).unwrap();
         assert_eq!(c.refresh.interval_mins, 30);
         assert_eq!(c.refresh.horizon_hours, 48);
+        assert_eq!(c.refresh.reaction_horizon_mins, 60);
+        assert_eq!(c.refresh.reaction_early_check_secs, 60);
         assert_eq!(c.store.path, std::path::PathBuf::from("relay.db"));
+    }
+
+    #[test]
+    fn refresh_reaction_knobs_override_parses() {
+        std::env::set_var("TEST_HOOK_RXN", "https://discord.com/api/webhooks/1/x");
+        let p = write_tmp(
+            "refresh_reaction_override",
+            "routes: []\nwebhooks:\n  h1: { env: TEST_HOOK_RXN }\nmedia: { mode: reupload, max_bytes: 1000 }\nrefresh: { reaction_horizon_mins: 90, reaction_early_check_secs: 30 }\n",
+        );
+        let c = Config::load(&p).unwrap();
+        // Unset edit/delete knobs keep their defaults...
+        assert_eq!(c.refresh.interval_mins, 30);
+        assert_eq!(c.refresh.horizon_hours, 48);
+        // ...while the reaction knobs take the configured values.
+        assert_eq!(c.refresh.reaction_horizon_mins, 90);
+        assert_eq!(c.refresh.reaction_early_check_secs, 30);
     }
 
     #[test]

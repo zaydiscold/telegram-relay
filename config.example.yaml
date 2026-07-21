@@ -21,11 +21,19 @@ media:
   max_bytes: 10000000
 
 # Optional. Posts are relayed as live-updating Discord embeds; the refresh
-# worker re-checks each post on this cadence and PATCHes reaction/comment/edit
-# changes (and marks deletes) until it ages past the horizon. Defaults shown.
+# worker re-checks each post and PATCHes changes. Two cadences run at once:
+#   * edits + deletes  — checked every `interval_mins` for the full
+#     `horizon_hours` (the most pertinent changes).
+#   * reactions + comments — QoL only, so checked a few times early
+#     (at ~`reaction_early_check_secs`, then at `interval_mins`, then at
+#     `reaction_horizon_mins`) and then frozen once a post ages past
+#     `reaction_horizon_mins`. This keeps Telegram request volume low.
+# Defaults shown.
 refresh:
-  interval_mins: 30         # how often to re-check tracked posts
-  horizon_hours: 48         # stop updating (and prune) posts older than this
+  interval_mins: 30              # edit/delete re-check cadence
+  horizon_hours: 48             # stop updating (and prune) posts older than this
+  reaction_horizon_mins: 60     # stop updating reactions/comments after this
+  reaction_early_check_secs: 60 # the early "+1 min" reaction burst check
 
 # Optional. SQLite file tracking relayed posts so embeds can be updated in
 # place across restarts. Defaults to relay.db in the working directory.
