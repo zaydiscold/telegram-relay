@@ -334,9 +334,19 @@ async fn backfill(
     let mut skipped_dupe = 0usize;
     let mut dropped = 0usize;
 
+    let mut skipped_empty = 0usize;
     for msg in &messages {
         let msg_id = msg.id();
         let raw_body = msg.text().to_string();
+
+        // Skip service/empty messages (e.g. a "pinned a message" action): no
+        // text and no media means nothing to relay but a blank embed.
+        if !telegram::has_relayable_content(&raw_body, msg.media().is_some()) {
+            info!(msg_id, "backfill: skipping message with no relayable content");
+            skipped_empty += 1;
+            continue;
+        }
+
         if let Some(f) = &route.filter {
             if !passes_filter(&raw_body, f) {
                 skipped_filter += 1;
@@ -425,12 +435,12 @@ async fn backfill(
 
     info!(
         fetched = fetched_total,
-        posted, skipped_filter, skipped_dupe, dropped, "backfill complete"
+        posted, skipped_empty, skipped_filter, skipped_dupe, dropped, "backfill complete"
     );
     println!(
         "backfill '{route_name}': {fetched_total} fetched, {posted} posted, \
-         {skipped_filter} skipped (filter), {skipped_dupe} skipped (already relayed), \
-         {dropped} dropped"
+         {skipped_empty} skipped (no content), {skipped_filter} skipped (filter), \
+         {skipped_dupe} skipped (already relayed), {dropped} dropped"
     );
     Ok(())
 }

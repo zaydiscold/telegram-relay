@@ -292,16 +292,32 @@ pub enum Incoming {
     },
 }
 
+/// Whether a message carries anything worth relaying.
+///
+/// Telegram service messages (a "pinned a message" / "joined" action) and empty
+/// messages report an empty `text()` and no `media()`. Relaying them produces a
+/// blank Discord embed, so both the live path and backfill skip anything with
+/// neither text nor media. A caption-less video still has media, so it relays.
+pub fn has_relayable_content(text: &str, has_media: bool) -> bool {
+    has_media || !text.trim().is_empty()
+}
+
 /// Classify a raw update into an [`Incoming`], or `None` for events we ignore.
 ///
 /// `NewMessage`/`MessageEdited` produce an `Incoming`; everything else is `None`.
 /// A message carrying media becomes `Incoming::Media`, otherwise `Incoming::Text`.
+/// Service/empty messages (e.g. a pin action) carry no relayable content and are
+/// dropped here so they never reach Discord as blank embeds.
 pub fn classify(update: Update) -> Option<Incoming> {
     let (message, edited) = match update {
         Update::NewMessage(m) => (m, false),
         Update::MessageEdited(m) => (m, true),
         _ => return None,
     };
+
+    if !has_relayable_content(message.text(), message.media().is_some()) {
+        return None;
+    }
 
     let chat = ChatId(message.peer_id().bot_api_dialog_id_unchecked());
     let msg_id = message.id();
@@ -393,4 +409,35 @@ fn prompt(msg: &str) -> anyhow::Result<String> {
     let mut line = String::new();
     io::stdin().read_line(&mut line).context("reading stdin")?;
     Ok(line)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_relayable_content;
+
+    #[test]
+    fn text_only_message_relays() {
+        assert!(has_relayable_content("gm", false));
+    }
+
+    #[test]
+    fn media_with_caption_relays() {
+        assert!(has_relayable_content("nice video", true));
+    }
+
+    #[test]
+    fn captionless_media_still_relays() {
+        assert!(has_relayable_content("", true));
+    }
+
+    #[test]
+    fn service_or_empty_message_is_skipped() {
+        // A pin/join service message: empty text, no media.
+        assert!(!has_relayable_content("", false));
+    }
+
+    #[test]
+    fn whitespace_only_no_media_is_skipped() {
+        assert!(!has_relayable_content("   \n  ", false));
+    }
 }
