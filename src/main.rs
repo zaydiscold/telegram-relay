@@ -342,7 +342,10 @@ async fn backfill(
         // Skip service/empty messages (e.g. a "pinned a message" action): no
         // text and no media means nothing to relay but a blank embed.
         if !telegram::has_relayable_content(&raw_body, msg.media().is_some()) {
-            info!(msg_id, "backfill: skipping message with no relayable content");
+            info!(
+                msg_id,
+                "backfill: skipping message with no relayable content"
+            );
             skipped_empty += 1;
             continue;
         }
