@@ -80,7 +80,12 @@ impl GrammersFetcher {
 }
 
 /// Distil a fetched grammers message into a [`FetchedPost`].
-fn to_fetched(msg: &grammers_client::message::Message) -> FetchedPost {
+///
+/// `pub` (not private): main.rs's `backfill` command lives in the separate
+/// binary crate, so it needs this exported to reuse the exact same
+/// title/body/deep-link/reactions/comment-count extraction the refresh worker
+/// uses, rather than duplicating it.
+pub fn to_fetched(msg: &grammers_client::message::Message) -> FetchedPost {
     let title = msg
         .peer()
         .and_then(|p| p.name())

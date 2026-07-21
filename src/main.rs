@@ -20,7 +20,7 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use telegram_relay::cli::{Cli, Command, SESSION_FILE};
+use telegram_relay::cli::{clamp_backfill_count, Cli, Command, SESSION_FILE};
 use telegram_relay::config::{Config, MediaCfg, MediaMode, WebhookName, WebhookUrl};
 use telegram_relay::dedup::Dedup;
 use telegram_relay::deliver::{Deliverer, Outcome, PostResult};
@@ -62,6 +62,11 @@ async fn main() -> anyhow::Result<()> {
         Command::Login { config } => login(&config).await,
         Command::Chats { config } => chats(&config).await,
         Command::Check { config } => check(&config).await,
+        Command::Backfill {
+            config,
+            route,
+            count,
+        } => backfill(&config, &route, count).await,
     }
 }
 
@@ -204,6 +209,226 @@ fn webhook_label(body: &str) -> String {
         }
         Err(_) => "reachable".to_string(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// backfill — relay recent channel history on demand
+// ---------------------------------------------------------------------------
+
+/// Reverse grammers' newest-to-oldest `iter_messages` order into
+/// oldest-to-newest, so backfilled posts land in the same chronological order
+/// live traffic would have produced them.
+fn oldest_first<T>(mut v: Vec<T>) -> Vec<T> {
+    v.reverse();
+    v
+}
+
+/// `telegram-relay backfill <route> [--count N]`.
+///
+/// Loads config, connects, resolves ONLY the named route (erroring loudly if
+/// it doesn't exist), fetches its `count` most recent messages, and relays
+/// them oldest -> newest through the same filter -> embed -> post -> record
+/// pipeline `run` uses for live updates — so the refresh worker picks the
+/// resulting posts up on its next tick same as anything relayed live.
+///
+/// Differences from the live path, by design (see module docs / spec):
+/// * Sequential, not fire-and-forget: this is a one-shot CLI call, so posts
+///   are awaited in order rather than spawned, which is what keeps them
+///   oldest -> newest on the Discord side.
+/// * Media messages relay caption/text + deep link only; the download lane is
+///   skipped entirely and a "media omitted (backfill)" line is appended.
+/// * Dedup against the store: a (chat, msg, webhook) triple already recorded
+///   (e.g. relayed live, or by an earlier backfill run) is skipped, not
+///   double-posted.
+async fn backfill(
+    config_path: &Path,
+    route_name: &str,
+    requested_count: usize,
+) -> anyhow::Result<()> {
+    let count = clamp_backfill_count(requested_count);
+    let (api_id, _api_hash) = api_credentials()?;
+    let cfg = Config::load(config_path).context("loading config")?;
+
+    let route = cfg
+        .routes
+        .iter()
+        .find(|r| r.name == route_name)
+        .ok_or_else(|| {
+            let available: Vec<&str> = cfg.routes.iter().map(|r| r.name.as_str()).collect();
+            anyhow!(
+                "route '{route_name}' not found in {}; available route(s): {}",
+                config_path.display(),
+                if available.is_empty() {
+                    "(none configured)".to_string()
+                } else {
+                    available.join(", ")
+                }
+            )
+        })?;
+
+    let mut targets: Vec<(WebhookName, WebhookUrl)> = Vec::new();
+    for name in &route.to {
+        match cfg.webhooks.get(name) {
+            Some(url) => targets.push((name.clone(), url.clone())),
+            None => {
+                warn!(webhook = %name.0, route = %route_name, "route references unknown webhook")
+            }
+        }
+    }
+    if targets.is_empty() {
+        return Err(anyhow!(
+            "route '{route_name}' has no resolvable webhook targets; check config.yaml"
+        ));
+    }
+
+    let deliverer = Deliverer::new();
+    let store = Store::open(&cfg.store.path).context("opening message store")?;
+
+    let conn = telegram::connect(api_id, Path::new(SESSION_FILE)).await?;
+    if !conn.client.is_authorized().await? {
+        conn.handle.quit();
+        let _ = conn.pool_task.await;
+        return Err(anyhow!("not authorized; run `telegram-relay login` first"));
+    }
+
+    let resolved = match telegram::resolve_chat_peer(&conn.client, &route.from).await {
+        Ok(r) => r,
+        Err(e) => {
+            conn.handle.quit();
+            let _ = conn.pool_task.await;
+            return Err(e.context(format!("resolving route '{route_name}' for backfill")));
+        }
+    };
+    info!(
+        route = route_name,
+        chat = resolved.chat.0,
+        title = %resolved.title,
+        count,
+        "backfill: fetching recent messages"
+    );
+
+    let mut messages = Vec::with_capacity(count);
+    {
+        let mut iter = conn.client.iter_messages(resolved.peer).limit(count);
+        loop {
+            match iter.next().await {
+                Ok(Some(msg)) => messages.push(msg),
+                Ok(None) => break,
+                Err(e) => {
+                    conn.handle.quit();
+                    let _ = conn.pool_task.await;
+                    return Err(anyhow!("fetching message history for '{route_name}': {e}"));
+                }
+            }
+        }
+    }
+    let fetched_total = messages.len();
+    let messages = oldest_first(messages);
+
+    let mut posted = 0usize;
+    let mut skipped_filter = 0usize;
+    let mut skipped_dupe = 0usize;
+    let mut dropped = 0usize;
+
+    for msg in &messages {
+        let msg_id = msg.id();
+        let raw_body = msg.text().to_string();
+        if let Some(f) = &route.filter {
+            if !passes_filter(&raw_body, f) {
+                skipped_filter += 1;
+                continue;
+            }
+        }
+
+        let fetched = refresh::to_fetched(msg);
+        let mut body = fetched.body.clone();
+        if msg.media().is_some() {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str("media omitted (backfill)");
+        }
+
+        let sender = msg.sender().and_then(|p| p.name()).map(|s| s.to_string());
+        let username = display_name(sender.as_deref(), &route.name);
+        let title = if fetched.title.is_empty() {
+            route.name.clone()
+        } else {
+            fetched.title.clone()
+        };
+        let text = RelayText {
+            sender: sender.clone(),
+            body: body.clone(),
+            reply_quote: None,
+            edited: false,
+        };
+        let meta = EmbedMeta {
+            title,
+            avatar_url: None,
+            deep_link: fetched.deep_link.clone(),
+            reactions: fetched.reactions.clone(),
+            comment_count: fetched.comment_count,
+            deleted: false,
+        };
+        let embeds = render::embed(&text, &meta);
+        let hash = content_hash(&body);
+
+        for (name, url) in &targets {
+            match store.already_relayed(resolved.chat.0, msg_id, &name.0) {
+                Ok(true) => {
+                    info!(
+                        chat = resolved.chat.0,
+                        msg_id,
+                        webhook = %name.0,
+                        "backfill: already relayed; skipping"
+                    );
+                    skipped_dupe += 1;
+                    continue;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(error = %e, chat = resolved.chat.0, msg_id, "backfill: dedup check failed; posting anyway");
+                }
+            }
+
+            match deliverer.post_embed(url, &username, &embeds).await {
+                PostResult::Delivered { discord_msg_id } => {
+                    let record = NewRecord {
+                        chat_id: resolved.chat.0,
+                        tg_msg_id: msg_id,
+                        route: route.name.clone(),
+                        webhook_name: name.0.clone(),
+                        discord_msg_id,
+                        content_hash: hash.clone(),
+                        reactions: fetched.reactions.clone(),
+                        comment_count: fetched.comment_count,
+                    };
+                    if let Err(e) = store.record(record) {
+                        warn!(error = %e, "backfill: failed to record relayed message");
+                    }
+                    posted += 1;
+                }
+                PostResult::Dropped { reason } => {
+                    warn!(%reason, chat = resolved.chat.0, msg_id, webhook = %name.0, "backfill: delivery dropped");
+                    dropped += 1;
+                }
+            }
+        }
+    }
+
+    conn.handle.quit();
+    let _ = conn.pool_task.await;
+
+    info!(
+        fetched = fetched_total,
+        posted, skipped_filter, skipped_dupe, dropped, "backfill complete"
+    );
+    println!(
+        "backfill '{route_name}': {fetched_total} fetched, {posted} posted, \
+         {skipped_filter} skipped (filter), {skipped_dupe} skipped (already relayed), \
+         {dropped} dropped"
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -803,5 +1028,49 @@ fn media_filename(media: &Media, msg_id: i32) -> String {
         Media::Photo(_) => format!("photo_{msg_id}.jpg"),
         Media::Sticker(_) => format!("sticker_{msg_id}.webp"),
         _ => format!("media_{msg_id}.bin"),
+    }
+}
+
+#[cfg(test)]
+mod backfill_tests {
+    use super::*;
+
+    #[test]
+    fn oldest_first_reverses_newest_to_oldest_order() {
+        // grammers' iter_messages().limit(N) yields newest-to-oldest, e.g.
+        // ids [103, 102, 101] for the 3 most recent posts; backfill must relay
+        // them chronologically, i.e. [101, 102, 103].
+        assert_eq!(oldest_first(vec![103, 102, 101]), vec![101, 102, 103]);
+    }
+
+    #[test]
+    fn oldest_first_handles_empty_and_singleton() {
+        assert_eq!(oldest_first::<i32>(vec![]), Vec::<i32>::new());
+        assert_eq!(oldest_first(vec![42]), vec![42]);
+    }
+
+    #[test]
+    fn oldest_first_is_involutive() {
+        let original = vec![5, 4, 3, 2, 1];
+        let once = oldest_first(original.clone());
+        assert_eq!(once, vec![1, 2, 3, 4, 5]);
+        // reversing back recovers the original (a pure Vec::reverse, so
+        // applying it twice is a no-op on the sequence).
+        assert_eq!(oldest_first(once), original);
+    }
+
+    #[test]
+    fn clamp_backfill_count_matches_cli_defaults() {
+        // Sanity-check main.rs is using the same clamp cli.rs exposes (rather
+        // than a copy-pasted range), and that the documented default (3) and
+        // max (25) haven't silently drifted apart.
+        assert_eq!(
+            clamp_backfill_count(telegram_relay::cli::BACKFILL_DEFAULT_COUNT),
+            3
+        );
+        assert_eq!(
+            clamp_backfill_count(telegram_relay::cli::BACKFILL_MAX_COUNT + 100),
+            telegram_relay::cli::BACKFILL_MAX_COUNT
+        );
     }
 }

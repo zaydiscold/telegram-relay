@@ -164,6 +164,31 @@ impl Store {
         Ok(())
     }
 
+    /// Whether a Discord post already exists for this exact (chat, message,
+    /// webhook) triple. Used by the `backfill` CLI verb so re-running it (or
+    /// overlapping with live relay) skips rather than double-posting.
+    pub fn already_relayed(
+        &self,
+        chat_id: i64,
+        tg_msg_id: i32,
+        webhook_name: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let exists: bool = conn
+            .query_row(
+                r#"
+                SELECT EXISTS(
+                  SELECT 1 FROM relayed
+                  WHERE chat_id = ?1 AND tg_msg_id = ?2 AND webhook_name = ?3
+                )
+                "#,
+                rusqlite::params![chat_id, tg_msg_id, webhook_name],
+                |r| r.get(0),
+            )
+            .context("checking already_relayed")?;
+        Ok(exists)
+    }
+
     /// All non-deleted tracked messages posted within the last `horizon_hours`.
     ///
     /// Ordered by `chat_id, tg_msg_id` so the refresh worker can batch by chat.
@@ -391,6 +416,21 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn already_relayed_true_only_for_exact_triple() {
+        let path = tmp_db("already-relayed");
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).unwrap();
+
+        store.record(rec(1, 5, "d-a")).unwrap(); // webhook_name "hook" per rec()
+        assert!(store.already_relayed(1, 5, "hook").unwrap());
+        assert!(!store.already_relayed(1, 5, "other-hook").unwrap());
+        assert!(!store.already_relayed(1, 6, "hook").unwrap());
+        assert!(!store.already_relayed(2, 5, "hook").unwrap());
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

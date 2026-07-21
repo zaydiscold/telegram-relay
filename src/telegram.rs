@@ -183,6 +183,73 @@ pub async fn resolve_routes(client: &Client, cfg: &Config) -> anyhow::Result<Res
     })
 }
 
+/// A single resolved chat plus the [`PeerRef`](grammers_client::session::types::PeerRef)
+/// needed to fetch its message history (`iter_messages`).
+pub struct ResolvedChat {
+    pub chat: ChatId,
+    pub title: String,
+    pub peer: grammers_client::session::types::PeerRef,
+}
+
+/// Resolve one route's `ChatRef` to a concrete chat + `PeerRef`, for the
+/// `backfill` CLI verb.
+///
+/// Unlike [`resolve_routes`] (which only captures a `PeerRef` for
+/// `ChatRef::Username` routes — numeric-id routes still relay live updates
+/// fine without one), `backfill` needs a `PeerRef` unconditionally because
+/// `Client::iter_messages` requires one. For `ChatRef::Id` routes that means
+/// falling back to a dialog scan (mirroring [`list_chats`]) to find the
+/// matching peer and derive its ref from there.
+pub async fn resolve_chat_peer(
+    client: &Client,
+    chat_ref: &ChatRef,
+) -> anyhow::Result<ResolvedChat> {
+    match chat_ref {
+        ChatRef::Username(username) => {
+            let peer = client
+                .resolve_username(username)
+                .await
+                .with_context(|| format!("resolving @{username}"))?
+                .ok_or_else(|| anyhow!("username '@{username}' not found"))?;
+            let id = peer.id().bot_api_dialog_id_unchecked();
+            let title = peer.name().unwrap_or(username).to_string();
+            let pref = peer
+                .to_ref()
+                .await
+                .map_err(|e| anyhow!("resolving peer ref for @{username}: {e}"))?
+                .ok_or_else(|| anyhow!("no peer ref available for @{username} (never seen it?)"))?;
+            Ok(ResolvedChat {
+                chat: ChatId(id),
+                title,
+                peer: pref,
+            })
+        }
+        ChatRef::Id(id) => {
+            let mut dialogs = client.iter_dialogs();
+            while let Some(dialog) = dialogs.next().await? {
+                let peer = dialog.peer();
+                if peer.id().bot_api_dialog_id_unchecked() == id.0 {
+                    let title = peer.name().unwrap_or("(no title)").to_string();
+                    let pref = peer
+                        .to_ref()
+                        .await
+                        .map_err(|e| anyhow!("resolving peer ref for chat {}: {e}", id.0))?
+                        .ok_or_else(|| anyhow!("no peer ref available for chat {}", id.0))?;
+                    return Ok(ResolvedChat {
+                        chat: *id,
+                        title,
+                        peer: pref,
+                    });
+                }
+            }
+            Err(anyhow!(
+                "chat id {} not found among dialogs (never seen it, or account lost access?)",
+                id.0
+            ))
+        }
+    }
+}
+
 /// Print an `id  type  title` table of all dialogs (the `chats` CLI verb).
 pub async fn list_chats(client: &Client) -> anyhow::Result<()> {
     let mut dialogs = client.iter_dialogs();
