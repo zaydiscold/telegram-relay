@@ -14,7 +14,12 @@ pub const EMBED_DESC_LIMIT: usize = 4096;
 pub const MAX_EMBEDS: usize = 10;
 
 /// "Let's get this bag" footer variations. One is chosen at random per post.
+///
+/// Rendered uniformly as `by zayd — {variant}`. Loosely themed in four groups —
+/// bag, trenches, tips, and game/mission callouts — so the rotation stays varied
+/// across a busy day of relaying.
 pub static FOOTERS: &[&str] = &[
+    // -- bag --
     "let's get this bag",
     "bag secured, next",
     "the bag does not sleep",
@@ -30,6 +35,39 @@ pub static FOOTERS: &[&str] = &[
     "another day, another bag",
     "the bag is patient",
     "wagmi, bag included",
+    "the bag waits for no one",
+    "secure the bag, then sleep",
+    "bag in, bag out",
+    "chasing the bag since block zero",
+    "no bag, no glory",
+    "the bag compounds",
+    "eyes on the bag, always",
+    "all gas, no bag left behind",
+    "the bag is a lifestyle",
+    "bag acquired",
+    // -- trenches --
+    "survived the trenches",
+    "we go again — the trenches don't quit",
+    "born in the trenches",
+    "the trenches remember",
+    "another day in the trenches",
+    "no retreat, no surrender, no paper hands",
+    "hold the line",
+    "war. war never changes.",
+    "war changes everything",
+    "the bag never changes",
+    // -- tips --
+    "tip: the trend is your friend until it ends",
+    "tip: never risk the bag you can't replace",
+    "tip: green candles lie, red candles teach",
+    "tip: the exit is a skill, not an afterthought",
+    "tip: zoom out",
+    // -- game / mission --
+    "respawn: back in the trenches",
+    "mission failed successfully",
+    "objective: extract the bag",
+    "tactical bag secured",
+    "stay frosty",
 ];
 
 /// Pick a random footer variant.
@@ -334,6 +372,32 @@ mod tests {
         for _ in 0..50 {
             assert!(FOOTERS.contains(&footer_variant()));
         }
+    }
+
+    #[test]
+    fn footer_rotation_is_wide_and_unique() {
+        // The rotation was expanded from the original 15 to 45; a shrinking
+        // list (or a copy-paste duplicate) makes the footer repeat noticeably
+        // on a busy relay day, so both are locked down here.
+        assert_eq!(FOOTERS.len(), 45, "footer rotation changed size");
+        let unique: std::collections::BTreeSet<&&str> = FOOTERS.iter().collect();
+        assert_eq!(unique.len(), FOOTERS.len(), "duplicate footer variant");
+        assert!(
+            FOOTERS.iter().all(|f| !f.trim().is_empty()),
+            "empty footer variant"
+        );
+    }
+
+    #[test]
+    fn footer_rotation_actually_varies() {
+        // A stuck RNG (or an accidental FOOTERS[0]) would still pass
+        // `footer_variant_is_from_list`; this catches it.
+        let seen: std::collections::BTreeSet<&str> = (0..500).map(|_| footer_variant()).collect();
+        assert!(
+            seen.len() > 10,
+            "footer_variant looks stuck: only {} distinct in 500 draws",
+            seen.len()
+        );
     }
 
     #[test]
