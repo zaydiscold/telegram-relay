@@ -31,8 +31,12 @@ use telegram_relay::router::{ResolvedRoute, Router};
 use telegram_relay::store::{NewRecord, Store};
 use telegram_relay::telegram::{self, Incoming};
 
+use base64::Engine;
 use grammers_client::media::Media;
 use grammers_client::Client;
+
+use telegram_relay::deliver::Outcome;
+use telegram_relay::telegram::ChannelIdentity;
 
 /// Heartbeat interval — an `info!` line proving the loop is alive.
 const HEARTBEAT: Duration = Duration::from_secs(300);
@@ -694,6 +698,18 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
             return Err(e);
         }
     };
+    // Best-effort: mirror each source channel's title + photo onto its Discord
+    // webhook's persistent name + avatar. Runs once, after resolution, before
+    // the loop starts. Never fatal — a failure here must not stop relaying.
+    sync_webhook_identities(
+        &deliverer,
+        &store,
+        &cfg.webhooks,
+        &resolved.routes,
+        &resolved.identities,
+    )
+    .await;
+
     // Peer refs for the refresh worker (keyed by bot-API chat id).
     let peer_refs = resolved
         .peers
@@ -1381,6 +1397,117 @@ async fn download_media(client: &Client, media: &Media) -> anyhow::Result<Vec<u8
     Ok(bytes)
 }
 
+// ---------------------------------------------------------------------------
+// webhook avatar/name sync
+// ---------------------------------------------------------------------------
+
+/// Stable content hash of a webhook's intended identity (title + photo bytes).
+///
+/// FNV-1a over the title, a separator, and the photo bytes — deterministic
+/// across runs so it can be persisted and compared. A title rename OR a new
+/// photo changes the hash and triggers a re-PATCH; nothing else does. The
+/// separator prevents a title/photo boundary ambiguity.
+fn avatar_identity_hash(title: &str, photo: Option<&[u8]>) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut mix = |bytes: &[u8]| {
+        for b in bytes {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    };
+    mix(title.as_bytes());
+    mix(&[0x00]); // domain separator between title and photo
+    match photo {
+        Some(bytes) => mix(bytes),
+        None => mix(b"<no-photo>"),
+    }
+    format!("{h:016x}")
+}
+
+/// Encode raw JPEG photo bytes as a Discord `data:` avatar URI.
+///
+/// Telegram profile photos are JPEG, so the mime is `image/jpeg`; Discord sniffs
+/// the actual bytes but the label must be an image type it accepts.
+fn photo_data_uri(bytes: &[u8]) -> String {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    format!("data:image/jpeg;base64,{b64}")
+}
+
+/// Best-effort: mirror each source channel's title + photo onto its destination
+/// Discord webhook's persistent name + avatar, once at startup.
+///
+/// * Only routes with a resolved [`ChannelIdentity`] (i.e. `@username` routes)
+///   participate; numeric-id routes leave the webhook untouched.
+/// * A webhook shared by several routes is set by the FIRST route that can set
+///   it; later routes log "shared; skipped" and move on (a webhook has exactly
+///   one avatar).
+/// * The PATCH only fires when the identity hash differs from the last-synced
+///   one recorded in the store, so restarts don't churn Discord's rate limit.
+/// * Every failure is logged (token-scrubbed) and swallowed — this must never
+///   block or break message relay.
+async fn sync_webhook_identities(
+    deliverer: &Deliverer,
+    store: &Store,
+    webhooks: &HashMap<WebhookName, WebhookUrl>,
+    routes: &[ResolvedRoute],
+    identities: &HashMap<telegram_relay::config::ChatId, ChannelIdentity>,
+) {
+    let mut claimed: HashSet<String> = HashSet::new();
+    for route in routes {
+        let Some(identity) = identities.get(&route.chat) else {
+            continue; // numeric-id route (or unresolved): don't touch its webhooks
+        };
+        for hook in &route.to {
+            if claimed.contains(&hook.0) {
+                info!(
+                    webhook = %hook.0,
+                    route = %route.name,
+                    "webhook avatar already set by an earlier route; shared, skipping"
+                );
+                continue;
+            }
+            let Some(url) = webhooks.get(hook) else {
+                continue; // unknown webhook already warned about elsewhere
+            };
+            claimed.insert(hook.0.clone());
+
+            let hash = avatar_identity_hash(&identity.title, identity.photo.as_deref());
+            match store.webhook_identity_hash(&hook.0) {
+                Ok(Some(prev)) if prev == hash => {
+                    info!(webhook = %hook.0, "webhook identity unchanged; skipping avatar PATCH");
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(error = %e, webhook = %hook.0, "webhook identity hash check failed; syncing anyway");
+                }
+            }
+
+            let data_uri = identity.photo.as_deref().map(photo_data_uri);
+            match deliverer
+                .patch_webhook(url, Some(&identity.title), data_uri.as_deref())
+                .await
+            {
+                Outcome::Delivered => {
+                    info!(webhook = %hook.0, title = %identity.title, had_photo = identity.photo.is_some(), "webhook identity synced");
+                    if let Err(e) = store.set_webhook_identity_hash(&hook.0, &hash) {
+                        warn!(error = %e, webhook = %hook.0, "failed to record webhook identity hash");
+                    }
+                }
+                Outcome::Dropped { reason } => {
+                    // Scrub any webhook token before it reaches the log, matching
+                    // the redaction guarantee on every other egress path.
+                    warn!(
+                        reason = %scrub_webhook_tokens(&reason),
+                        webhook = %hook.0,
+                        "webhook identity sync failed; continuing"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Best-effort filename for an attachment.
 fn media_filename(media: &Media, msg_id: i32) -> String {
     match media {
@@ -1551,6 +1678,57 @@ mod album_coalesce_tests {
         a.targets[0].color = 0xFF8800;
         let album = coalesce_album(vec![a]).expect("non-empty batch");
         assert_eq!(album.targets[0].color, 0xFF8800);
+    }
+}
+
+#[cfg(test)]
+mod avatar_tests {
+    use super::{avatar_identity_hash, photo_data_uri};
+
+    #[test]
+    fn identity_hash_is_stable_and_deterministic() {
+        let a = avatar_identity_hash("Rob's Channel", Some(b"jpegbytes"));
+        let b = avatar_identity_hash("Rob's Channel", Some(b"jpegbytes"));
+        assert_eq!(a, b, "same title+photo must hash identically across calls");
+    }
+
+    #[test]
+    fn identity_hash_changes_on_title_rename() {
+        let before = avatar_identity_hash("Old Name", Some(b"photo"));
+        let after = avatar_identity_hash("New Name", Some(b"photo"));
+        assert_ne!(before, after, "a rename must trigger a re-PATCH");
+    }
+
+    #[test]
+    fn identity_hash_changes_on_new_photo() {
+        let before = avatar_identity_hash("Same", Some(b"photo-v1"));
+        let after = avatar_identity_hash("Same", Some(b"photo-v2"));
+        assert_ne!(before, after, "a new photo must trigger a re-PATCH");
+    }
+
+    #[test]
+    fn identity_hash_distinguishes_no_photo_from_photo() {
+        let none = avatar_identity_hash("Chan", None);
+        let some = avatar_identity_hash("Chan", Some(b"anything"));
+        assert_ne!(none, some);
+        // ...and no-photo is itself stable.
+        assert_eq!(none, avatar_identity_hash("Chan", None));
+    }
+
+    #[test]
+    fn identity_hash_separator_prevents_title_photo_ambiguity() {
+        // Without the domain separator, ("ab", "c") and ("a", "bc") would
+        // collide once title and photo are concatenated.
+        let x = avatar_identity_hash("ab", Some(b"c"));
+        let y = avatar_identity_hash("a", Some(b"bc"));
+        assert_ne!(x, y);
+    }
+
+    #[test]
+    fn photo_data_uri_is_base64_jpeg() {
+        // "Hi" -> base64 "SGk="
+        assert_eq!(photo_data_uri(b"Hi"), "data:image/jpeg;base64,SGk=");
+        assert!(photo_data_uri(&[0xFF, 0xD8, 0xFF]).starts_with("data:image/jpeg;base64,"));
     }
 }
 

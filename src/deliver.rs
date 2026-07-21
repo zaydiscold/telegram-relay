@@ -128,6 +128,64 @@ impl Deliverer {
         }
     }
 
+    /// PATCH the webhook resource itself to set its persistent `name` and/or
+    /// `avatar` (a base64 `data:` URI). Discord stores these on the webhook, so
+    /// every subsequent post shows the channel's name + photo without per-message
+    /// overrides.
+    ///
+    /// Best-effort: returns an [`Outcome`] the caller logs but never fails on —
+    /// avatar syncing must not block relaying. A single 429 is honored once; any
+    /// other non-success is a drop. The drop reason is URL-stripped so a webhook
+    /// token can never leak (same guarantee as every other method here).
+    pub async fn patch_webhook(
+        &self,
+        url: &WebhookUrl,
+        name: Option<&str>,
+        avatar_data_uri: Option<&str>,
+    ) -> Outcome {
+        let mut body = serde_json::Map::new();
+        if let Some(n) = name {
+            body.insert("name".to_string(), serde_json::json!(n));
+        }
+        if let Some(a) = avatar_data_uri {
+            body.insert("avatar".to_string(), serde_json::json!(a));
+        }
+        if body.is_empty() {
+            return Outcome::Dropped {
+                reason: "patch_webhook called with nothing to set".to_string(),
+            };
+        }
+        let body = serde_json::Value::Object(body);
+
+        let resp = self.http.patch(&url.0).json(&body).send().await;
+        match resp {
+            Ok(r) if r.status().is_success() => Outcome::Delivered,
+            Ok(r) if r.status().as_u16() == 429 => {
+                let wait = retry_after_secs(&r).unwrap_or(1.0);
+                tokio::time::sleep(Duration::from_secs_f64(wait)).await;
+                match self.http.patch(&url.0).json(&body).send().await {
+                    Ok(r) if r.status().is_success() => Outcome::Delivered,
+                    Ok(r) => Outcome::Dropped {
+                        reason: format!("webhook patch failed after 429 retry: {}", r.status()),
+                    },
+                    Err(e) => Outcome::Dropped {
+                        reason: format!("webhook patch network: {}", e.without_url()),
+                    },
+                }
+            }
+            Ok(r) => {
+                let status = r.status();
+                let text = r.text().await.unwrap_or_default();
+                Outcome::Dropped {
+                    reason: format!("webhook patch failed: {status}: {text}"),
+                }
+            }
+            Err(e) => Outcome::Dropped {
+                reason: format!("webhook patch network: {}", e.without_url()),
+            },
+        }
+    }
+
     pub async fn post_file(
         &self,
         url: &WebhookUrl,

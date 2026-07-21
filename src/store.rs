@@ -127,6 +127,14 @@ impl Store {
               comment_count INTEGER NOT NULL DEFAULT 0,
               deleted INTEGER NOT NULL DEFAULT 0,
               PRIMARY KEY (chat_id, tg_msg_id, discord_msg_id));
+
+            -- Tracks the last identity (title + photo) pushed to each Discord
+            -- webhook, so the avatar/name PATCH only fires when the source
+            -- channel's photo or title actually changed (rate-limit friendly).
+            CREATE TABLE IF NOT EXISTS webhook_identity (
+              webhook_name TEXT PRIMARY KEY,
+              identity_hash TEXT NOT NULL,
+              updated_at INTEGER NOT NULL);
             "#,
         )
         .context("creating relayed table")?;
@@ -278,6 +286,40 @@ impl Store {
             .execute("DELETE FROM relayed WHERE posted_at < ?1", [cutoff])
             .context("pruning old rows")?;
         Ok(n)
+    }
+
+    /// The identity hash last pushed to `webhook_name`, if any.
+    ///
+    /// Used to skip the webhook avatar/name PATCH when the source channel's
+    /// title + photo are unchanged since the last sync.
+    pub fn webhook_identity_hash(&self, webhook_name: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let hash = conn
+            .query_row(
+                "SELECT identity_hash FROM webhook_identity WHERE webhook_name = ?1",
+                rusqlite::params![webhook_name],
+                |r| r.get::<_, String>(0),
+            )
+            .ok();
+        Ok(hash)
+    }
+
+    /// Record the identity hash just pushed to `webhook_name` (upsert).
+    pub fn set_webhook_identity_hash(&self, webhook_name: &str, identity_hash: &str) -> Result<()> {
+        let now = now_secs();
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.execute(
+            r#"
+            INSERT INTO webhook_identity (webhook_name, identity_hash, updated_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(webhook_name) DO UPDATE SET
+              identity_hash = excluded.identity_hash,
+              updated_at = excluded.updated_at
+            "#,
+            rusqlite::params![webhook_name, identity_hash, now],
+        )
+        .context("upserting webhook identity hash")?;
+        Ok(())
     }
 
     /// Test/diagnostic helper: total row count.
@@ -434,6 +476,45 @@ mod tests {
         assert!(!store.already_relayed(1, 6, "hook").unwrap());
         assert!(!store.already_relayed(2, 5, "hook").unwrap());
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn webhook_identity_hash_roundtrip_and_upsert() {
+        let path = tmp_db("wh-identity");
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).unwrap();
+
+        // Absent until set.
+        assert_eq!(store.webhook_identity_hash("hook").unwrap(), None);
+
+        store.set_webhook_identity_hash("hook", "h1").unwrap();
+        assert_eq!(
+            store.webhook_identity_hash("hook").unwrap(),
+            Some("h1".to_string())
+        );
+
+        // Upsert replaces the hash for the same webhook.
+        store.set_webhook_identity_hash("hook", "h2").unwrap();
+        assert_eq!(
+            store.webhook_identity_hash("hook").unwrap(),
+            Some("h2".to_string())
+        );
+
+        // Distinct webhooks are independent.
+        assert_eq!(store.webhook_identity_hash("other").unwrap(), None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn due_carries_route_name() {
+        let path = tmp_db("due-route");
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).unwrap();
+        store.record(rec(1, 1, "d-a")).unwrap(); // route "r1" per rec()
+        let due = store.due(48).unwrap();
+        assert_eq!(due[0].route, "r1");
         let _ = std::fs::remove_file(&path);
     }
 

@@ -212,6 +212,76 @@ async fn patch_handler(State(h): State<Hits>, body: String) -> StatusCode {
 }
 
 #[tokio::test]
+async fn patch_webhook_sets_name_and_avatar() {
+    let hits = Hits::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    // PATCH is on the webhook resource itself (no /messages/{id} suffix).
+    let app = Router::new()
+        .route("/hook", patch(patch_handler))
+        .with_state(hits.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let url = format!("http://{addr}/hook");
+
+    let d = Deliverer::new();
+    let out = d
+        .patch_webhook(
+            &WebhookUrl(url),
+            Some("Rob's Channel"),
+            Some("data:image/jpeg;base64,SGk="),
+        )
+        .await;
+    assert!(matches!(out, Outcome::Delivered));
+    let bodies = hits.0.lock().unwrap();
+    assert_eq!(bodies.len(), 1);
+    let v: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+    assert_eq!(v["name"], "Rob's Channel");
+    assert_eq!(v["avatar"], "data:image/jpeg;base64,SGk=");
+}
+
+#[tokio::test]
+async fn patch_webhook_name_only_omits_avatar() {
+    let hits = Hits::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route("/hook", patch(patch_handler))
+        .with_state(hits.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let url = format!("http://{addr}/hook");
+
+    let d = Deliverer::new();
+    let out = d
+        .patch_webhook(&WebhookUrl(url), Some("Nameless Chan"), None)
+        .await;
+    assert!(matches!(out, Outcome::Delivered));
+    let bodies = hits.0.lock().unwrap();
+    let v: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+    assert_eq!(v["name"], "Nameless Chan");
+    assert!(
+        v.get("avatar").is_none(),
+        "avatar should be omitted, not null"
+    );
+}
+
+#[tokio::test]
+async fn patch_webhook_error_reason_never_leaks_token() {
+    // Closed port + token-bearing URL: the drop reason must not carry the token.
+    let d = Deliverer::new();
+    let url = WebhookUrl("http://127.0.0.1:1/api/webhooks/123456789/SUPERSECRETTOKEN".into());
+    let out = d
+        .patch_webhook(&url, Some("x"), Some("data:image/jpeg;base64,AA=="))
+        .await;
+    match out {
+        Outcome::Dropped { reason } => assert!(
+            !reason.contains("SUPERSECRETTOKEN"),
+            "webhook patch drop reason leaked the token: {reason}"
+        ),
+        Outcome::Delivered => panic!("expected a network failure against a closed port"),
+    }
+}
+
+#[tokio::test]
 async fn patch_embed_hits_messages_endpoint() {
     let hits = Hits::default();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

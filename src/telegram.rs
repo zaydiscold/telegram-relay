@@ -139,6 +139,57 @@ pub async fn interactive_login(client: &Client, api_hash: &str) -> anyhow::Resul
 pub struct Resolution {
     pub routes: Vec<ResolvedRoute>,
     pub peers: HashMap<ChatId, grammers_client::session::types::PeerRef>,
+    /// Per-chat display identity (title + profile photo bytes) used to set the
+    /// destination Discord webhook's persistent name + avatar. Populated only
+    /// for `ChatRef::Username` routes (where a full [`Peer`] is resolved);
+    /// numeric-id routes have no entry and leave the webhook identity untouched.
+    pub identities: HashMap<ChatId, ChannelIdentity>,
+}
+
+/// A source channel's display identity, for mirroring onto the Discord webhook.
+#[derive(Debug, Clone, Default)]
+pub struct ChannelIdentity {
+    /// Channel title.
+    pub title: String,
+    /// Raw profile-photo bytes (JPEG), if the channel has one and it downloaded.
+    pub photo: Option<Vec<u8>>,
+}
+
+/// Best-effort download of a peer's profile photo into memory.
+///
+/// Never an error the caller must handle: any failure (no photo set, download
+/// error) yields `None`, because setting the webhook avatar is a cosmetic
+/// startup nicety that must never block or fail message relay. Uses the small
+/// (non-`big`) photo — Discord scales avatars down anyway.
+pub async fn fetch_chat_photo(
+    client: &Client,
+    peer: &grammers_client::peer::Peer,
+) -> Option<Vec<u8>> {
+    let chat_photo = match peer.photo(false).await {
+        Ok(Some(cp)) => cp,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!("fetching chat photo: {e}");
+            return None;
+        }
+    };
+    let mut download = client.iter_download(&chat_photo);
+    let mut bytes = Vec::new();
+    loop {
+        match download.next().await {
+            Ok(Some(chunk)) => bytes.extend_from_slice(&chunk),
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!("downloading chat photo: {e}");
+                return None;
+            }
+        }
+    }
+    if bytes.is_empty() {
+        None
+    } else {
+        Some(bytes)
+    }
 }
 
 /// Resolve each configured route's `from` into a concrete [`ChatId`].
@@ -150,6 +201,7 @@ pub struct Resolution {
 pub async fn resolve_routes(client: &Client, cfg: &Config) -> anyhow::Result<Resolution> {
     let mut resolved = Vec::with_capacity(cfg.routes.len());
     let mut peers = HashMap::new();
+    let mut identities: HashMap<ChatId, ChannelIdentity> = HashMap::new();
     for route in &cfg.routes {
         let (chat, title) = match &route.from {
             ChatRef::Username(username) => {
@@ -164,6 +216,15 @@ pub async fn resolve_routes(client: &Client, cfg: &Config) -> anyhow::Result<Res
                 let title = peer.name().unwrap_or(username).to_string();
                 if let Ok(Some(pref)) = peer.to_ref().await {
                     peers.insert(ChatId(id), pref);
+                }
+                // Capture the channel's display identity for the webhook avatar
+                // (best-effort; a missing/failed photo just yields `None`).
+                if let std::collections::hash_map::Entry::Vacant(e) = identities.entry(ChatId(id)) {
+                    let photo = fetch_chat_photo(client, &peer).await;
+                    e.insert(ChannelIdentity {
+                        title: title.clone(),
+                        photo,
+                    });
                 }
                 (ChatId(id), title)
             }
@@ -181,6 +242,7 @@ pub async fn resolve_routes(client: &Client, cfg: &Config) -> anyhow::Result<Res
     Ok(Resolution {
         routes: resolved,
         peers,
+        identities,
     })
 }
 

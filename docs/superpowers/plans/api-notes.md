@@ -327,3 +327,40 @@ and the refresh worker. Confirmed against
 
 5. **`PeerRef: Into<PeerRef>`** via the std blanket `impl<T> From<T> for T`,
    so it passes straight into `get_messages_by_id`.
+
+## Embed-identity additions (2026-07-21 — verified against vendored 0.10.0 source)
+
+Written while adding webhook avatar, embed color, and exact timestamp. All
+confirmed against `~/.cargo/registry/.../grammers-client-0.10.0/src` and
+`cargo clippy -D warnings` / `cargo test`.
+
+1. **`Message::date() -> chrono::DateTime<Utc>`** (`message/message.rs:344`)
+   returns the ORIGINAL publish time (the raw `message.date` TL field via
+   `date_timestamp()`); edit time is separate (`edit_date()`). `chrono` is
+   already in the tree transitively via grammers; we name it as a direct dep
+   (`default-features = false, features = ["std"]`) only to format that value —
+   we never call `Utc::now()`, so the `clock` feature is intentionally not
+   requested. Format for Discord's embed `timestamp` with
+   `dt.to_rfc3339_opts(SecondsFormat::Secs, true)` → `2026-07-20T18:04:05Z`.
+
+2. **Chat/channel profile photo download.** `Peer::photo(big: bool) -> Result<
+   Option<ChatPhoto>, InvocationError>` (`peer/mod.rs:185`) builds an
+   `InputPeerPhotoFileLocation` from the peer's cached `photo_id` — it does NOT
+   hit the network itself (may query the session for peer info). `ChatPhoto`
+   (`media/media.rs:94`) implements `Downloadable` (`media/media.rs:883`), so
+   the bytes come down through the SAME `client.iter_download(&chat_photo)` +
+   `download.next().await` chunk loop used for message media. `big=false` is the
+   small avatar (Discord scales down anyway). Per-kind photo accessors exist too
+   (`Channel::photo()`, `Group::photo()`, `User::photo()`), but `Peer::photo()`
+   is the uniform entry point. Telegram profile photos are JPEG, so the Discord
+   avatar `data:` URI uses `image/jpeg` (Discord sniffs the actual bytes; the
+   mime just has to be an accepted image type).
+
+3. **Discord webhook avatar/name are set by PATCHing the webhook resource
+   itself** — `PATCH {webhook_url}` with `{"name": "...", "avatar":
+   "data:image/jpeg;base64,..."}` — NOT a per-message override and NOT the
+   `.../messages/{id}` endpoint (that PATCHes a posted message). This persists
+   on the webhook, so every later post shows the channel's name + photo. This is
+   a Discord API fact, not a grammers one, but recorded here since it pairs with
+   (2). Guard churn with a stored identity hash; a webhook has exactly one
+   avatar, so a webhook shared by multiple routes is set once (first route wins).
