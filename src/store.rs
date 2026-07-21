@@ -138,9 +138,33 @@ impl Store {
             "#,
         )
         .context("creating relayed table")?;
+        Self::enable_incremental_auto_vacuum(&conn)?;
         Ok(Store {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Ensure the database uses INCREMENTAL auto-vacuum so pruned rows release
+    /// file space (via [`prune`](Self::prune)'s `PRAGMA incremental_vacuum`).
+    ///
+    /// The live db already exists in the default `none` (0) mode, and setting
+    /// `PRAGMA auto_vacuum=INCREMENTAL` does NOT convert an existing db on its
+    /// own — a one-time `VACUUM` is required. So: read the current mode, and only
+    /// when it is not already INCREMENTAL (2) set the pragma and VACUUM once to
+    /// rewrite the file with auto-vacuum enabled. On a brand-new db the VACUUM is
+    /// trivial. WAL is unaffected. (queued-polish §11a)
+    fn enable_incremental_auto_vacuum(conn: &Connection) -> Result<()> {
+        // 0 = none, 1 = full, 2 = incremental.
+        let mode: i64 = conn
+            .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+            .context("reading auto_vacuum mode")?;
+        if mode != 2 {
+            conn.pragma_update(None, "auto_vacuum", 2)
+                .context("setting auto_vacuum=INCREMENTAL")?;
+            conn.execute_batch("VACUUM")
+                .context("VACUUM to convert to incremental auto_vacuum")?;
+        }
+        Ok(())
     }
 
     /// Record a freshly-posted Discord message. Idempotent on the primary key.
@@ -285,6 +309,10 @@ impl Store {
         let n = conn
             .execute("DELETE FROM relayed WHERE posted_at < ?1", [cutoff])
             .context("pruning old rows")?;
+        // Release the pages the delete just freed back to the OS. A no-op when
+        // nothing is reclaimable; requires INCREMENTAL auto_vacuum (set on open).
+        conn.execute_batch("PRAGMA incremental_vacuum")
+            .context("incremental_vacuum after prune")?;
         Ok(n)
     }
 
@@ -515,6 +543,51 @@ mod tests {
         store.record(rec(1, 1, "d-a")).unwrap(); // route "r1" per rec()
         let due = store.due(48).unwrap();
         assert_eq!(due[0].route, "r1");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_enables_incremental_auto_vacuum() {
+        let path = tmp_db("autovac-mode");
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).unwrap();
+        let mode: i64 = {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(mode, 2, "auto_vacuum should be INCREMENTAL (2)");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_is_idempotent_on_already_incremental_db() {
+        // Re-opening a db that is already INCREMENTAL must not error (the mode
+        // check skips the one-time VACUUM the second time).
+        let path = tmp_db("autovac-idem");
+        let _ = std::fs::remove_file(&path);
+        {
+            let s = Store::open(&path).unwrap();
+            s.record(rec(1, 1, "d-a")).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.count().unwrap(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn prune_runs_incremental_vacuum_without_error() {
+        let path = tmp_db("autovac-prune");
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).unwrap();
+        for i in 0..20 {
+            store.record(rec(1, i, &format!("d-{i}"))).unwrap();
+        }
+        // Age everything past the horizon, then prune (which incremental_vacuums).
+        store.backdate_all(49 * 3600);
+        let pruned = store.prune(48).unwrap();
+        assert_eq!(pruned, 20);
+        assert_eq!(store.count().unwrap(), 0);
         let _ = std::fs::remove_file(&path);
     }
 
