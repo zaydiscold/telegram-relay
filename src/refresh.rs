@@ -47,7 +47,11 @@ pub struct FetchedPost {
     pub body: String,
     pub deep_link: Option<String>,
     pub reactions: BTreeMap<String, i32>,
-    pub comment_count: i32,
+    /// Discussion/comment count as reported by this fetch. `None` = "unknown":
+    /// the refresh fetch (`get_messages_by_id`) does not populate `replies`, so
+    /// `reply_count()` returns `None` and the stored value must be preserved
+    /// rather than downgraded to 0 (queued-polish §10b).
+    pub comment_count: Option<i32>,
     /// ORIGINAL Telegram publish time, RFC3339. Re-read on every fetch so a
     /// PATCHed embed keeps the source timestamp instead of losing it.
     pub date: Option<String>,
@@ -103,7 +107,9 @@ pub fn to_fetched(msg: &grammers_client::message::Message) -> FetchedPost {
         body: msg.text().to_string(),
         deep_link,
         reactions: extract_reactions(msg),
-        comment_count: msg.reply_count().unwrap_or(0),
+        // `None` (reply_count not populated) is preserved as "unknown" — the
+        // diff/apply path keeps the stored count instead of writing 0 (§10b).
+        comment_count: msg.reply_count(),
         date: Some(render::embed_timestamp(msg.date())),
     }
 }
@@ -171,6 +177,17 @@ pub fn content_hash(body: &str) -> String {
     format!("{h:016x}")
 }
 
+/// The comment count to display/store for a fetched post, given the value we
+/// already have stored.
+///
+/// The refresh fetch (`get_messages_by_id`) does not populate `replies`, so
+/// `reply_count()` returns `None`. Treat that as "unknown" and keep the stored
+/// count rather than downgrading a real value to 0 (queued-polish §10b). Only a
+/// concrete `Some(n)` updates the count.
+pub fn effective_comment_count(fetched: Option<i32>, stored: i32) -> i32 {
+    fetched.unwrap_or(stored)
+}
+
 /// Pure diff: what (if anything) needs PATCHing for one tracked message.
 pub fn diff(tracked: &TrackedMsg, fetched: Option<&FetchedPost>) -> RefreshAction {
     match fetched {
@@ -178,10 +195,18 @@ pub fn diff(tracked: &TrackedMsg, fetched: Option<&FetchedPost>) -> RefreshActio
         Some(f) => {
             if content_hash(&f.body) != tracked.content_hash {
                 RefreshAction::Edited
-            } else if f.reactions != tracked.reactions || f.comment_count != tracked.comment_count {
-                RefreshAction::StatsChanged
             } else {
-                RefreshAction::None
+                // An unknown (`None`) comment count is never a change — preserve
+                // the stored value instead of reporting a spurious StatsChanged.
+                let comments_changed = match f.comment_count {
+                    Some(n) => n != tracked.comment_count,
+                    None => false,
+                };
+                if f.reactions != tracked.reactions || comments_changed {
+                    RefreshAction::StatsChanged
+                } else {
+                    RefreshAction::None
+                }
             }
         }
     }
@@ -352,6 +377,10 @@ async fn apply(
         }
         RefreshAction::Edited | RefreshAction::StatsChanged => {
             let f = fetched.expect("edited/stats implies a fetched post");
+            // Preserve the stored comment count when the fetch reports it as
+            // unknown (`None`), so a reaction-only refresh never zeroes a real
+            // comment count (§10b).
+            let comment_count = effective_comment_count(f.comment_count, row.comment_count);
             let text = RelayText {
                 sender: None,
                 body: f.body.clone(),
@@ -363,7 +392,7 @@ async fn apply(
                 avatar_url: None,
                 deep_link: f.deep_link.clone(),
                 reactions: f.reactions.clone(),
-                comment_count: f.comment_count,
+                comment_count,
                 deleted: false,
                 color,
                 timestamp: f.date.clone(),
@@ -376,7 +405,7 @@ async fn apply(
                 &row.discord_msg_id,
                 &content_hash(&f.body),
                 &f.reactions,
-                f.comment_count,
+                comment_count,
             )?;
         }
     }
@@ -421,8 +450,17 @@ mod tests {
             body: body.into(),
             deep_link: Some("https://t.me/c/5".into()),
             reactions: map(reactions),
-            comment_count: comments,
+            comment_count: Some(comments),
             date: Some("2026-07-20T12:00:00Z".into()),
+        }
+    }
+
+    /// Like [`fetched`] but with an unknown (`None`) comment count — mirrors the
+    /// real refresh fetch, where `reply_count()` is not populated.
+    fn fetched_unknown_comments(body: &str, reactions: &[(&str, i32)]) -> FetchedPost {
+        FetchedPost {
+            comment_count: None,
+            ..fetched(body, reactions, 0)
         }
     }
 
@@ -471,6 +509,40 @@ mod tests {
     fn content_hash_is_stable_and_distinct() {
         assert_eq!(content_hash("abc"), content_hash("abc"));
         assert_ne!(content_hash("abc"), content_hash("abd"));
+    }
+
+    #[test]
+    fn unknown_comment_count_is_not_a_stats_change() {
+        // The live bug (§10b): a refresh fetch returns reply_count() == None, so
+        // comment_count is unknown. With reactions unchanged, this must NOT read
+        // as StatsChanged — otherwise the embed would be PATCHed to 0 comments.
+        let t = tracked("hello", &[("❤️", 3)], 47);
+        let f = fetched_unknown_comments("hello", &[("❤️", 3)]);
+        assert_eq!(diff(&t, Some(&f)), RefreshAction::None);
+    }
+
+    #[test]
+    fn unknown_comment_count_still_lets_reactions_update() {
+        // Comments unknown but reactions grew -> StatsChanged (reactions only).
+        let t = tracked("hello", &[("❤️", 3)], 47);
+        let f = fetched_unknown_comments("hello", &[("❤️", 9)]);
+        assert_eq!(diff(&t, Some(&f)), RefreshAction::StatsChanged);
+    }
+
+    #[test]
+    fn known_comment_count_updates() {
+        // A concrete Some(n) that differs is still a StatsChanged.
+        let t = tracked("hello", &[("❤️", 3)], 47);
+        let f = fetched("hello", &[("❤️", 3)], 50);
+        assert_eq!(diff(&t, Some(&f)), RefreshAction::StatsChanged);
+    }
+
+    #[test]
+    fn effective_comment_count_prefers_known_keeps_stored_on_unknown() {
+        // Some(n) wins; None keeps the stored value (never downgrades to 0).
+        assert_eq!(effective_comment_count(Some(50), 47), 50);
+        assert_eq!(effective_comment_count(None, 47), 47);
+        assert_eq!(effective_comment_count(Some(0), 47), 0);
     }
 
     // A fake fetcher proving the trait is injectable for the fetch/diff loop.

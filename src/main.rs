@@ -450,7 +450,7 @@ async fn backfill(
                     fetched.deep_link.as_deref(),
                     sender.as_deref(),
                     &fetched.reactions,
-                    fetched.comment_count,
+                    fetched.comment_count.unwrap_or(0),
                     fetched.date.as_deref(),
                     &files,
                     &media_targets,
@@ -498,7 +498,7 @@ async fn backfill(
             avatar_url: None,
             deep_link: fetched.deep_link.clone(),
             reactions: fetched.reactions.clone(),
-            comment_count: fetched.comment_count,
+            comment_count: fetched.comment_count.unwrap_or(0),
             deleted: false,
             color: route.color,
             timestamp: fetched.date.clone(),
@@ -536,7 +536,7 @@ async fn backfill(
                         discord_msg_id,
                         content_hash: hash.clone(),
                         reactions: fetched.reactions.clone(),
-                        comment_count: fetched.comment_count,
+                        comment_count: fetched.comment_count.unwrap_or(0),
                     };
                     if let Err(e) = store.record(record) {
                         warn!(error = %e, "backfill: failed to record relayed message");
