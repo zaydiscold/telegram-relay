@@ -793,8 +793,12 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("installing SIGTERM handler")?;
 
+    // Quiet ops (queued-polish §13): NO routine lifecycle post on start —
+    // those fired on every deploy/restart and were pure noise. Silence is
+    // healthy; the systemd OnFailure watchdog covers "down", and the feed
+    // flowing (plus `stats`) answers "is it up". Only error/drop notices and
+    // route-resolution failures still post. Startup is logged locally only.
     info!("relay started; watching {} route(s)", cfg.routes.len());
-    ops.notice("relay started").await;
 
     loop {
         tokio::select! {
@@ -847,8 +851,9 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
         }
     }
 
+    // Quiet ops (queued-polish §13): no "shutting down" post either — a clean
+    // stop is not an incident. Logged locally only.
     info!("shutting down");
-    ops.notice("relay shutting down").await;
 
     // Force-flush any albums still inside their quiet window so they are
     // delivered rather than dropped on shutdown.
