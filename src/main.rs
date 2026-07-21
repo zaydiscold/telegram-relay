@@ -282,14 +282,18 @@ async fn backfill(
     }
 
     let deliverer = Deliverer::new();
-    let store = Store::open(&cfg.store.path).context("opening message store")?;
 
+    // Connect BEFORE opening the store: grammers-session (libsql) must call
+    // sqlite3_config() before rusqlite initializes the linked-in SQLite, or it
+    // panics with SQLITE_MISUSE. Same load-bearing ordering as `run`.
     let conn = telegram::connect(api_id, Path::new(SESSION_FILE)).await?;
     if !conn.client.is_authorized().await? {
         conn.handle.quit();
         let _ = conn.pool_task.await;
         return Err(anyhow!("not authorized; run `telegram-relay login` first"));
     }
+
+    let store = Store::open(&cfg.store.path).context("opening message store")?;
 
     let resolved = match telegram::resolve_chat_peer(&conn.client, &route.from).await {
         Ok(r) => r,
