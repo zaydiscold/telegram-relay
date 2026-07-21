@@ -1,0 +1,20 @@
+[Unit]
+Description=Telegram to Discord relay
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+User=zaydk
+WorkingDirectory=/home/zaydk/telegram-relay
+ExecStart=/home/zaydk/telegram-relay/target/release/telegram-relay run
+Restart=always
+RestartSec=2
+Environment=RUST_LOG=info
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/zaydk/telegram-relay
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
