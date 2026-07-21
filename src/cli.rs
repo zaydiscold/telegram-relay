@@ -62,6 +62,11 @@ pub enum Command {
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
+    /// Print store counters + relay latency percentiles (no network). Exit 0.
+    Stats {
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
     /// Relay the most recent N messages from one route's chat, on demand.
     ///
     /// Fetches via the same live pipeline (filter, embed, post, record) so the

@@ -66,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Login { config } => login(&config).await,
         Command::Chats { config } => chats(&config).await,
         Command::Check { config } => check(&config).await,
+        Command::Stats { config } => stats_cmd(&config),
         Command::Backfill {
             config,
             route,
@@ -215,6 +216,34 @@ fn webhook_label(body: &str) -> String {
         }
         Err(_) => "reachable".to_string(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// stats — store counters + relay latency percentiles
+// ---------------------------------------------------------------------------
+
+/// `telegram-relay stats`: open the store and print tracked-post / deleted
+/// counts plus latency p50/p95/min/max over recorded LIVE relays. No network;
+/// always exits 0. Latency is `NULL` for backfilled rows, so those are excluded.
+fn stats_cmd(config_path: &Path) -> anyhow::Result<()> {
+    let cfg = Config::load(config_path).context("loading config")?;
+    let store = Store::open(&cfg.store.path).context("opening message store")?;
+    let s = store.stats().context("reading store stats")?;
+
+    const W: usize = 18;
+    println!("{:<W$}{}", "tracked posts", s.tracked_posts);
+    println!("{:<W$}{}", "deleted", s.deleted);
+    match s.latency {
+        Some(l) => {
+            println!("{:<W$}{}", "latency samples", l.count);
+            println!("{:<W$}{} ms", "latency p50", l.p50);
+            println!("{:<W$}{} ms", "latency p95", l.p95);
+            println!("{:<W$}{} ms", "latency min", l.min);
+            println!("{:<W$}{} ms", "latency max", l.max);
+        }
+        None => println!("{:<W$}(no live relays recorded yet)", "latency"),
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -537,6 +566,7 @@ async fn backfill(
                         content_hash: hash.clone(),
                         reactions: fetched.reactions.clone(),
                         comment_count: fetched.comment_count.unwrap_or(0),
+                        latency_ms: None, // backfill latency is meaningless
                     };
                     if let Err(e) = store.record(record) {
                         warn!(error = %e, "backfill: failed to record relayed message");
@@ -942,9 +972,11 @@ async fn handle_update(
                             content_hash: hash.clone(),
                             reactions: Default::default(),
                             comment_count: 0,
+                            latency_ms: None, // measured on delivery
                         },
                         username.clone(),
                         embeds.clone(),
+                        date.clone(),
                     );
                 }
             }
@@ -1042,9 +1074,11 @@ async fn handle_update(
                             content_hash: hash.clone(),
                             reactions: Default::default(),
                             comment_count: 0,
+                            latency_ms: None, // measured on delivery
                         },
                         username,
                         embeds,
+                        date.clone(),
                     );
                 }
                 return;
@@ -1104,6 +1138,7 @@ fn spawn_embed(
     mut record: NewRecord,
     username: String,
     embeds: serde_json::Value,
+    telegram_date: String,
 ) {
     tokio::spawn(async move {
         // Durable dedup: the in-memory LRU is empty after a restart, and
@@ -1127,7 +1162,20 @@ fn spawn_embed(
 
         match deliverer.post_embed(&url, &username, &embeds).await {
             PostResult::Delivered { discord_msg_id } => {
+                // Live relay: measure true end-to-end latency from the two
+                // authoritative clocks (Discord snowflake vs Telegram date).
+                let latency = relay_latency_ms(&discord_msg_id, &telegram_date);
+                if let Some(ms) = latency {
+                    info!(
+                        tg_msg_id = record.tg_msg_id,
+                        latency_ms = ms,
+                        "relayed msg {} in {}ms",
+                        record.tg_msg_id,
+                        ms
+                    );
+                }
                 record.discord_msg_id = discord_msg_id;
+                record.latency_ms = latency;
                 if let Err(e) = store.record(record) {
                     warn!(error = %e, "failed to record relayed message");
                 }
@@ -1331,6 +1379,21 @@ async fn deliver_coalesced_media(
             .await
         {
             PostResult::Delivered { discord_msg_id } => {
+                // Latency is only meaningful for LIVE relays (ops present); the
+                // backfill path passes `ops: None` and records NULL latency.
+                let latency_ms = match (ops, timestamp) {
+                    (Some(_), Some(ts)) => relay_latency_ms(&discord_msg_id, ts),
+                    _ => None,
+                };
+                if let Some(ms) = latency_ms {
+                    info!(
+                        tg_msg_id = anchor_msg_id,
+                        latency_ms = ms,
+                        "relayed msg {} in {}ms",
+                        anchor_msg_id,
+                        ms
+                    );
+                }
                 let record = NewRecord {
                     chat_id,
                     tg_msg_id: anchor_msg_id,
@@ -1340,6 +1403,7 @@ async fn deliver_coalesced_media(
                     content_hash: hash.clone(),
                     reactions: reactions.clone(),
                     comment_count,
+                    latency_ms,
                 };
                 if let Err(e) = store.record(record) {
                     warn!(error = %e, "failed to record relayed media");
@@ -1385,6 +1449,30 @@ fn display_name(sender: Option<&str>, route_name: &str) -> String {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => route_name.to_string(),
     }
+}
+
+/// Discord epoch (2015-01-01T00:00:00Z) in milliseconds — the offset a snowflake
+/// timestamp is measured from.
+const DISCORD_EPOCH_MS: i64 = 1_420_070_400_000;
+
+/// Decode a Discord message snowflake into its creation time (ms since Unix
+/// epoch): the top 42 bits are ms since the Discord epoch. `None` if the id is
+/// not a plain integer.
+fn snowflake_ms(discord_msg_id: &str) -> Option<i64> {
+    let id: u64 = discord_msg_id.parse().ok()?;
+    Some((id >> 22) as i64 + DISCORD_EPOCH_MS)
+}
+
+/// End-to-end relay latency in ms: Discord receive time (decoded from the
+/// message snowflake) minus the Telegram publish time (`message.date()`, second
+/// resolution, carried as the RFC3339 embed timestamp). `None` if either clock
+/// can't be read. Accurate to ~1s since Telegram's date is second-resolution.
+fn relay_latency_ms(discord_msg_id: &str, telegram_date_rfc3339: &str) -> Option<i64> {
+    let discord_ms = snowflake_ms(discord_msg_id)?;
+    let telegram_ms = chrono::DateTime::parse_from_rfc3339(telegram_date_rfc3339)
+        .ok()?
+        .timestamp_millis();
+    Some(discord_ms - telegram_ms)
 }
 
 /// Download a media file fully into memory via the chunked download iterator.
@@ -1729,6 +1817,52 @@ mod avatar_tests {
         // "Hi" -> base64 "SGk="
         assert_eq!(photo_data_uri(b"Hi"), "data:image/jpeg;base64,SGk=");
         assert!(photo_data_uri(&[0xFF, 0xD8, 0xFF]).starts_with("data:image/jpeg;base64,"));
+    }
+}
+
+#[cfg(test)]
+mod latency_tests {
+    use super::{relay_latency_ms, snowflake_ms, DISCORD_EPOCH_MS};
+
+    #[test]
+    fn snowflake_decodes_to_discord_epoch_ms() {
+        // id 0 -> exactly the Discord epoch; the low 22 bits are worker/seq and
+        // must be masked off by the >>22 shift.
+        assert_eq!(snowflake_ms("0"), Some(DISCORD_EPOCH_MS));
+        // (1 << 22) ms after epoch = epoch + 1ms.
+        assert_eq!(
+            snowflake_ms(&(1u64 << 22).to_string()),
+            Some(DISCORD_EPOCH_MS + 1)
+        );
+        // A realistic snowflake decodes to a sane 2020s timestamp (> epoch).
+        let id = "1234567890123456789";
+        assert!(snowflake_ms(id).unwrap() > DISCORD_EPOCH_MS);
+    }
+
+    #[test]
+    fn snowflake_rejects_non_integer() {
+        assert_eq!(snowflake_ms("not-a-number"), None);
+        assert_eq!(snowflake_ms(""), None);
+    }
+
+    #[test]
+    fn latency_is_discord_minus_telegram() {
+        // Telegram published at 2021-01-01T00:00:00Z (unix 1609459200 -> *1000).
+        // Build a Discord id whose snowflake time is 240ms later.
+        let telegram_ms: i64 = 1_609_459_200_000;
+        let discord_ms = telegram_ms + 240;
+        let id = (((discord_ms - DISCORD_EPOCH_MS) as u64) << 22).to_string();
+        assert_eq!(
+            relay_latency_ms(&id, "2021-01-01T00:00:00Z"),
+            Some(240),
+            "latency must be Discord snowflake ms minus Telegram publish ms"
+        );
+    }
+
+    #[test]
+    fn latency_none_on_bad_inputs() {
+        assert_eq!(relay_latency_ms("nope", "2021-01-01T00:00:00Z"), None);
+        assert_eq!(relay_latency_ms("123", "not-a-date"), None);
     }
 }
 

@@ -32,6 +32,61 @@ pub struct NewRecord {
     pub content_hash: String,
     pub reactions: BTreeMap<String, i32>,
     pub comment_count: i32,
+    /// End-to-end relay latency in milliseconds (Discord snowflake time minus
+    /// Telegram publish time). `Some` only for LIVE relays; backfilled rows carry
+    /// `None` because their latency is meaningless. (queued-polish §3)
+    pub latency_ms: Option<i64>,
+}
+
+/// Aggregate latency figures over the recorded LIVE relays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LatencyStats {
+    pub count: usize,
+    pub p50: i64,
+    pub p95: i64,
+    pub min: i64,
+    pub max: i64,
+}
+
+/// A snapshot of store-wide counters for the `stats` CLI verb.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreStats {
+    /// Distinct Telegram posts currently tracked (across all fan-out webhooks).
+    pub tracked_posts: i64,
+    /// Rows marked deleted on Telegram.
+    pub deleted: i64,
+    /// Latency percentiles over rows with a recorded latency, or `None` when no
+    /// live relay has been recorded yet.
+    pub latency: Option<LatencyStats>,
+}
+
+/// Nearest-rank percentile of a pre-sorted ascending slice (`p` in `0..=100`).
+fn percentile(sorted: &[i64], p: usize) -> i64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = ((p as f64 / 100.0) * sorted.len() as f64).ceil() as usize;
+    let idx = rank.saturating_sub(1).min(sorted.len() - 1);
+    sorted[idx]
+}
+
+/// Compute latency percentiles from raw millisecond samples (pure; testable).
+///
+/// Returns `None` for an empty sample set. Uses the nearest-rank method for
+/// p50/p95, so results are always actual observed values.
+pub fn latency_stats(values: &[i64]) -> Option<LatencyStats> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut v = values.to_vec();
+    v.sort_unstable();
+    Some(LatencyStats {
+        count: v.len(),
+        p50: percentile(&v, 50),
+        p95: percentile(&v, 95),
+        min: v[0],
+        max: v[v.len() - 1],
+    })
 }
 
 /// A tracked Discord message that the refresh worker may need to update.
@@ -126,6 +181,7 @@ impl Store {
               reactions TEXT NOT NULL DEFAULT '{}',
               comment_count INTEGER NOT NULL DEFAULT 0,
               deleted INTEGER NOT NULL DEFAULT 0,
+              latency_ms INTEGER,
               PRIMARY KEY (chat_id, tg_msg_id, discord_msg_id));
 
             -- Tracks the last identity (title + photo) pushed to each Discord
@@ -138,10 +194,26 @@ impl Store {
             "#,
         )
         .context("creating relayed table")?;
+        // Defensive migration for the already-deployed live db, which was created
+        // before the latency_ms column existed. A no-op (ignored duplicate-column
+        // error) once the column is present — including on brand-new dbs where the
+        // CREATE above already added it. (queued-polish §3)
+        Self::add_column_if_missing(&conn, "ALTER TABLE relayed ADD COLUMN latency_ms INTEGER")?;
         Self::enable_incremental_auto_vacuum(&conn)?;
         Ok(Store {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Run an `ALTER TABLE ... ADD COLUMN`, treating an already-present column as
+    /// success (SQLite reports `duplicate column name`). Any other failure is an
+    /// error.
+    fn add_column_if_missing(conn: &Connection, alter_sql: &str) -> Result<()> {
+        match conn.execute_batch(alter_sql) {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().contains("duplicate column name") => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("running migration: {alter_sql}")),
+        }
     }
 
     /// Ensure the database uses INCREMENTAL auto-vacuum so pruned rows release
@@ -175,8 +247,9 @@ impl Store {
             r#"
             INSERT INTO relayed
               (chat_id, tg_msg_id, route, webhook_name, discord_msg_id,
-               posted_at, last_checked, content_hash, reactions, comment_count, deleted)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, 0)
+               posted_at, last_checked, content_hash, reactions, comment_count,
+               deleted, latency_ms)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, 0, ?10)
             ON CONFLICT(chat_id, tg_msg_id, discord_msg_id) DO UPDATE SET
               content_hash = excluded.content_hash,
               reactions = excluded.reactions,
@@ -193,6 +266,7 @@ impl Store {
                 rec.content_hash,
                 reactions_to_json(&rec.reactions),
                 rec.comment_count,
+                rec.latency_ms,
             ],
         )
         .context("inserting relayed row")?;
@@ -350,6 +424,40 @@ impl Store {
         Ok(())
     }
 
+    /// Aggregate counters + latency percentiles for the `stats` CLI verb.
+    ///
+    /// `tracked_posts` counts distinct Telegram posts (a post fanned out to N
+    /// webhooks counts once); `deleted` counts rows tombstoned on Telegram.
+    /// Latency percentiles cover only rows with a recorded `latency_ms` (live
+    /// relays); backfilled rows have `NULL` and are excluded.
+    pub fn stats(&self) -> Result<StoreStats> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let tracked_posts: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT chat_id || ':' || tg_msg_id) FROM relayed",
+                [],
+                |r| r.get(0),
+            )
+            .context("counting tracked posts")?;
+        let deleted: i64 = conn
+            .query_row("SELECT COUNT(*) FROM relayed WHERE deleted = 1", [], |r| {
+                r.get(0)
+            })
+            .context("counting deleted rows")?;
+        let mut stmt =
+            conn.prepare("SELECT latency_ms FROM relayed WHERE latency_ms IS NOT NULL")?;
+        let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+        let mut values = Vec::new();
+        for row in rows {
+            values.push(row?);
+        }
+        Ok(StoreStats {
+            tracked_posts,
+            deleted,
+            latency: latency_stats(&values),
+        })
+    }
+
     /// Test/diagnostic helper: total row count.
     pub fn count(&self) -> Result<i64> {
         let conn = self.conn.lock().expect("store mutex poisoned");
@@ -389,6 +497,7 @@ mod tests {
             content_hash: "h0".into(),
             reactions: map(&[("❤️", 1)]),
             comment_count: 0,
+            latency_ms: None,
         }
     }
 
@@ -597,5 +706,78 @@ mod tests {
         let s = reactions_to_json(&m);
         assert_eq!(reactions_from_json(&s), m);
         assert_eq!(reactions_from_json("garbage"), BTreeMap::new());
+    }
+
+    #[test]
+    fn latency_stats_empty_is_none() {
+        assert_eq!(latency_stats(&[]), None);
+    }
+
+    #[test]
+    fn latency_stats_single_sample() {
+        let s = latency_stats(&[240]).unwrap();
+        assert_eq!(s.count, 1);
+        assert_eq!((s.p50, s.p95, s.min, s.max), (240, 240, 240, 240));
+    }
+
+    #[test]
+    fn latency_stats_percentiles_nearest_rank() {
+        // 1..=100 ms: nearest-rank p50 = 50, p95 = 95, min 1, max 100.
+        let vals: Vec<i64> = (1..=100).collect();
+        let s = latency_stats(&vals).unwrap();
+        assert_eq!(s.count, 100);
+        assert_eq!(s.p50, 50);
+        assert_eq!(s.p95, 95);
+        assert_eq!(s.min, 1);
+        assert_eq!(s.max, 100);
+    }
+
+    #[test]
+    fn latency_stats_is_order_independent() {
+        let a = latency_stats(&[300, 100, 200, 500, 400]).unwrap();
+        let b = latency_stats(&[500, 400, 300, 200, 100]).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.min, 100);
+        assert_eq!(a.max, 500);
+    }
+
+    #[test]
+    fn stats_counts_posts_deleted_and_latency() {
+        let path = tmp_db("stats");
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).unwrap();
+
+        // Two Discord rows for one post (100,5), one for (200,9): 2 distinct posts.
+        let mut a = rec(100, 5, "d-a");
+        a.latency_ms = Some(150);
+        store.record(a).unwrap();
+        let mut b = rec(100, 5, "d-b");
+        b.latency_ms = Some(450);
+        store.record(b).unwrap();
+        store.record(rec(200, 9, "d-c")).unwrap(); // backfill-style: NULL latency
+
+        store.mark_deleted(200, 9).unwrap();
+
+        let s = store.stats().unwrap();
+        assert_eq!(s.tracked_posts, 2, "distinct (chat,tg) posts");
+        assert_eq!(s.deleted, 1);
+        let lat = s.latency.expect("two live-relay latencies recorded");
+        assert_eq!(lat.count, 2);
+        assert_eq!(lat.min, 150);
+        assert_eq!(lat.max, 450);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn stats_latency_none_when_no_live_relays() {
+        let path = tmp_db("stats-nolat");
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).unwrap();
+        store.record(rec(1, 1, "d-a")).unwrap(); // NULL latency
+        let s = store.stats().unwrap();
+        assert_eq!(s.tracked_posts, 1);
+        assert!(s.latency.is_none());
+        let _ = std::fs::remove_file(&path);
     }
 }
