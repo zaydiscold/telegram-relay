@@ -280,10 +280,14 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
     let deliverer = Arc::new(Deliverer::new());
     let ops = Ops::new(deliverer.clone(), cfg.ops_webhook.clone());
 
+    // Telegram must connect BEFORE the store opens: grammers-session (libsql)
+    // calls sqlite3_config(), which fails with SQLITE_MISUSE if rusqlite has
+    // already initialized the linked-in SQLite. Order is load-bearing.
+    let conn = telegram::connect(api_id, Path::new(SESSION_FILE)).await?;
+
     let store = Arc::new(Store::open(&cfg.store.path).context("opening message store")?);
     info!("message store at {}", cfg.store.path.display());
 
-    let conn = telegram::connect(api_id, Path::new(SESSION_FILE)).await?;
     if !conn.client.is_authorized().await? {
         conn.handle.quit();
         let _ = conn.pool_task.await;
