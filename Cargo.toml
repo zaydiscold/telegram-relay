@@ -22,7 +22,11 @@ anyhow = "1"
 thiserror = "2"
 rpassword = "7"
 arc-swap = "1"
-rusqlite = { version = "0.32", features = ["bundled"] }
+# System SQLite, NOT bundled: grammers-session statically embeds libsql's own
+# sqlite3.c, and a second bundled copy collides at link time on Linux
+# (duplicate symbols under lld). Dynamic system linkage also gives rusqlite
+# state fully separate from libsql's.
+rusqlite = "0.32"
 rand = "0.8"
 
 [dev-dependencies]
