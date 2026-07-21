@@ -385,7 +385,11 @@ async fn backfill(
             deleted: false,
         };
         let embeds = render::embed(&text, &meta);
-        let hash = content_hash(&body);
+        // Hash the RAW caption (not the "media omitted (backfill)"-annotated
+        // body): the refresh worker recomputes the hash from msg.text() alone,
+        // so hashing the annotated body would make every backfilled media post
+        // look edited on the next refresh tick and get needlessly re-PATCHed.
+        let hash = content_hash(&fetched.body);
 
         for (name, url) in &targets {
             match store.already_relayed(resolved.chat.0, msg_id, &name.0) {
@@ -903,6 +907,25 @@ fn spawn_embed(
     embeds: serde_json::Value,
 ) {
     tokio::spawn(async move {
+        // Durable dedup: the in-memory LRU is empty after a restart, and
+        // `catch_up: true` replays messages seen before the restart — and a
+        // `backfill` run records to this same store. Consulting it here makes
+        // the live path idempotent across restarts and mutually idempotent
+        // with backfill, so an overlapping message is never posted twice.
+        match store.already_relayed(record.chat_id, record.tg_msg_id, &record.webhook_name) {
+            Ok(true) => {
+                info!(
+                    chat = record.chat_id,
+                    msg_id = record.tg_msg_id,
+                    webhook = %record.webhook_name,
+                    "already relayed (store); skipping"
+                );
+                return;
+            }
+            Ok(false) => {}
+            Err(e) => warn!(error = %e, "dedup store check failed; posting anyway"),
+        }
+
         match deliverer.post_embed(&url, &username, &embeds).await {
             PostResult::Delivered { discord_msg_id } => {
                 record.discord_msg_id = discord_msg_id;
