@@ -44,7 +44,14 @@ impl Deliverer {
 
     pub async fn post_text(&self, url: &WebhookUrl, username: &str, chunks: &[String]) -> Outcome {
         for chunk in chunks {
-            let body = serde_json::json!({ "content": chunk, "username": username });
+            // `allowed_mentions.parse: []` suppresses @everyone/@here/role/user
+            // pings: the tokens still render as plain text, but Discord parses no
+            // mentions from a relayed message's content.
+            let body = serde_json::json!({
+                "content": chunk,
+                "username": username,
+                "allowed_mentions": { "parse": [] },
+            });
             match self.send_json(url, &body).await {
                 Outcome::Delivered => {}
                 dropped => return dropped,
@@ -64,7 +71,11 @@ impl Deliverer {
         username: &str,
         embeds: &serde_json::Value,
     ) -> PostResult {
-        let body = serde_json::json!({ "embeds": embeds, "username": username });
+        let body = serde_json::json!({
+            "embeds": embeds,
+            "username": username,
+            "allowed_mentions": { "parse": [] },
+        });
         let target = format!("{}?wait=true", url.0);
         match self.send_json_capture(&target, &body).await {
             Ok(text) => match parse_message_id(&text) {
@@ -87,7 +98,7 @@ impl Deliverer {
         embeds: serde_json::Value,
     ) -> Outcome {
         let target = format!("{}/messages/{discord_msg_id}", url.0);
-        let body = serde_json::json!({ "embeds": embeds });
+        let body = serde_json::json!({ "embeds": embeds, "allowed_mentions": { "parse": [] } });
         let resp = self.http.patch(&target).json(&body).send().await;
         match resp {
             Ok(r) if r.status().is_success() => Outcome::Delivered,
@@ -100,7 +111,7 @@ impl Deliverer {
                         reason: format!("patch failed after 429 retry: {}", r.status()),
                     },
                     Err(e) => Outcome::Dropped {
-                        reason: format!("patch network: {e}"),
+                        reason: format!("patch network: {}", e.without_url()),
                     },
                 }
             }
@@ -112,7 +123,7 @@ impl Deliverer {
                 }
             }
             Err(e) => Outcome::Dropped {
-                reason: format!("patch network: {e}"),
+                reason: format!("patch network: {}", e.without_url()),
             },
         }
     }
@@ -125,7 +136,9 @@ impl Deliverer {
         bytes: Vec<u8>,
     ) -> Outcome {
         let part = reqwest::multipart::Part::bytes(bytes).file_name(filename.to_string());
-        let payload = serde_json::json!({ "username": username }).to_string();
+        let payload =
+            serde_json::json!({ "username": username, "allowed_mentions": { "parse": [] } })
+                .to_string();
         let form = reqwest::multipart::Form::new()
             .part("files[0]", part)
             .text("payload_json", payload);
@@ -196,7 +209,7 @@ impl Deliverer {
                 }
                 Err(e) => {
                     if attempt >= backoffs.len() {
-                        return Err(format!("network: {e}"));
+                        return Err(format!("network: {}", e.without_url()));
                     }
                     tokio::time::sleep(backoffs[attempt]).await;
                     attempt += 1;
@@ -218,7 +231,59 @@ impl Deliverer {
                 }
             }
             Err(e) => Outcome::Dropped {
-                reason: format!("upload network: {e}"),
+                reason: format!("upload network: {}", e.without_url()),
+            },
+        }
+    }
+
+    /// Post a rich embed with one or more attached files as a SINGLE Discord
+    /// message, capturing the created message id (via `?wait=true`).
+    ///
+    /// This is how relayed media is delivered: the caption/author/stats live in
+    /// `embeds` (built by [`crate::render::embed`]) and every album file rides
+    /// along as `files[N]` in the same multipart request, so an album is one
+    /// message rather than N. `allowed_mentions.parse: []` suppresses pings from
+    /// any mention text in the embed. Errors never include the webhook URL/token.
+    pub async fn post_media_embed(
+        &self,
+        url: &WebhookUrl,
+        username: &str,
+        embeds: &serde_json::Value,
+        files: Vec<(String, Vec<u8>)>,
+    ) -> PostResult {
+        let target = format!("{}?wait=true", url.0);
+        let payload = serde_json::json!({
+            "username": username,
+            "embeds": embeds,
+            "allowed_mentions": { "parse": [] },
+        })
+        .to_string();
+        // multipart Form is not clonable, so it is built fresh here (single
+        // attempt); the bytes are owned so a retry loop could rebuild it later.
+        let mut form = reqwest::multipart::Form::new().text("payload_json", payload);
+        for (i, (filename, bytes)) in files.into_iter().enumerate() {
+            let part = reqwest::multipart::Part::bytes(bytes).file_name(filename);
+            form = form.part(format!("files[{i}]"), part);
+        }
+        match self.http.post(&target).multipart(form).send().await {
+            Ok(r) if r.status().is_success() => {
+                let text = r.text().await.unwrap_or_default();
+                match parse_message_id(&text) {
+                    Some(id) => PostResult::Delivered { discord_msg_id: id },
+                    None => PostResult::Dropped {
+                        reason: format!("no message id in media response: {text}"),
+                    },
+                }
+            }
+            Ok(r) => {
+                let status = r.status();
+                let text = r.text().await.unwrap_or_default();
+                PostResult::Dropped {
+                    reason: format!("media upload failed: {status}: {text}"),
+                }
+            }
+            Err(e) => PostResult::Dropped {
+                reason: format!("media upload network: {}", e.without_url()),
             },
         }
     }

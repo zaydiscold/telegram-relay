@@ -127,6 +127,85 @@ async fn post_embed_captures_message_id() {
     assert!(bodies[0].contains("\"username\":\"Rob\""));
 }
 
+#[tokio::test]
+async fn post_text_suppresses_mentions() {
+    let hits = Hits::default();
+    let url = spawn(
+        Router::new()
+            .route("/hook", post(ok_handler))
+            .with_state(hits.clone()),
+    )
+    .await;
+    let d = Deliverer::new();
+    let out = d
+        .post_text(&WebhookUrl(url), "Rob", &["@everyone gm".into()])
+        .await;
+    assert!(matches!(out, Outcome::Delivered));
+    let bodies = hits.0.lock().unwrap();
+    let v: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+    // parse:[] is the load-bearing guard: it renders @everyone as plain text but
+    // suppresses the actual ping.
+    assert_eq!(v["allowed_mentions"]["parse"], serde_json::json!([]));
+}
+
+async fn media_ok_handler(State(h): State<Hits>, body: String) -> (StatusCode, String) {
+    h.0.lock().unwrap().push(body);
+    (StatusCode::OK, r#"{"id": "424242"}"#.into())
+}
+
+#[tokio::test]
+async fn post_media_embed_uploads_files_with_embed_and_suppresses_mentions() {
+    let hits = Hits::default();
+    let url = spawn(
+        Router::new()
+            .route("/hook", post(media_ok_handler))
+            .with_state(hits.clone()),
+    )
+    .await;
+    let d = Deliverer::new();
+    let embeds = serde_json::json!([{ "description": "album caption" }]);
+    // UTF-8 "bytes" so the multipart body stays a valid String for the extractor.
+    let files = vec![
+        ("photo_1.jpg".to_string(), b"AAAAA".to_vec()),
+        ("photo_2.jpg".to_string(), b"BBBBB".to_vec()),
+    ];
+    let out = d
+        .post_media_embed(&WebhookUrl(url), "Rob", &embeds, files)
+        .await;
+    match out {
+        PostResult::Delivered { discord_msg_id } => assert_eq!(discord_msg_id, "424242"),
+        PostResult::Dropped { reason } => panic!("expected delivered, got drop: {reason}"),
+    }
+    let bodies = hits.0.lock().unwrap();
+    assert_eq!(bodies.len(), 1);
+    let body = &bodies[0];
+    assert!(body.contains("payload_json"));
+    assert!(body.contains("allowed_mentions"));
+    assert!(body.contains("album caption"));
+    // Both files present, as distinct multipart parts with their filenames+bytes.
+    assert!(body.contains("files[0]") && body.contains("files[1]"));
+    assert!(body.contains("photo_1.jpg") && body.contains("photo_2.jpg"));
+    assert!(body.contains("AAAAA") && body.contains("BBBBB"));
+}
+
+#[tokio::test]
+async fn network_error_reason_never_leaks_webhook_token() {
+    // Point at a closed port with a token-bearing URL; the connect error must
+    // not carry the token into the drop reason (reqwest Error::without_url).
+    let d = Deliverer::new();
+    let url = WebhookUrl("http://127.0.0.1:1/api/webhooks/123456789/SUPERSECRETTOKEN".into());
+    let out = d.post_text(&url, "Rob", &["x".into()]).await;
+    match out {
+        Outcome::Dropped { reason } => {
+            assert!(
+                !reason.contains("SUPERSECRETTOKEN"),
+                "drop reason leaked the webhook token: {reason}"
+            );
+        }
+        Outcome::Delivered => panic!("expected a network failure against a closed port"),
+    }
+}
+
 async fn patch_handler(State(h): State<Hits>, body: String) -> StatusCode {
     h.0.lock().unwrap().push(body);
     StatusCode::OK
