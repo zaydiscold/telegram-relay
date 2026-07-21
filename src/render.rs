@@ -13,6 +13,22 @@ pub const EMBED_DESC_LIMIT: usize = 4096;
 /// Discord allows at most 10 embeds per message.
 pub const MAX_EMBEDS: usize = 10;
 
+/// Default embed stripe color: a vivid Telegram-ish neon blue (`#29B6F6`).
+///
+/// Used for every route that does not set `color: "#RRGGBB"` in config.yaml.
+/// Deliberately not the Discord-default gray — the left bar is the strongest
+/// at-a-glance signal that a post came from the Telegram relay.
+pub const DEFAULT_EMBED_COLOR: u32 = 0x29B6F6;
+
+/// Format a Telegram publish time for Discord's embed `timestamp` field.
+///
+/// Discord wants ISO8601/RFC3339; second precision with a `Z` suffix is what it
+/// renders (it shows a localized date/time next to the footer). This is the
+/// message's ORIGINAL publish time, never our relay time.
+pub fn embed_timestamp(dt: chrono::DateTime<chrono::Utc>) -> String {
+    dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
 /// "Let's get this bag" footer variations. One is chosen at random per post.
 ///
 /// Rendered uniformly as `by zayd — {variant}`. Loosely themed in four groups —
@@ -77,7 +93,11 @@ pub fn footer_variant() -> &'static str {
 }
 
 /// Context needed to build a rich embed beyond the message body itself.
-#[derive(Debug, Clone, Default)]
+///
+/// `Default` is hand-written rather than derived so `color` lands on
+/// [`DEFAULT_EMBED_COLOR`]; a derived `u32::default()` would be `0x000000`,
+/// i.e. a black stripe on every embed built from `..Default::default()`.
+#[derive(Debug, Clone)]
 pub struct EmbedMeta {
     /// Channel/chat title shown as the embed author.
     pub title: String,
@@ -91,6 +111,27 @@ pub struct EmbedMeta {
     pub comment_count: i32,
     /// Whether the source message was deleted on Telegram.
     pub deleted: bool,
+    /// Left-bar stripe color as a 24-bit RGB integer (Discord wants a decimal
+    /// int in the payload; `serde_json` emits it that way).
+    pub color: u32,
+    /// The source message's ORIGINAL Telegram publish time, RFC3339
+    /// (see [`embed_timestamp`]). `None` when it is not recoverable.
+    pub timestamp: Option<String>,
+}
+
+impl Default for EmbedMeta {
+    fn default() -> Self {
+        EmbedMeta {
+            title: String::new(),
+            avatar_url: None,
+            deep_link: None,
+            reactions: BTreeMap::new(),
+            comment_count: 0,
+            deleted: false,
+            color: DEFAULT_EMBED_COLOR,
+            timestamp: None,
+        }
+    }
 }
 
 /// Format the stats line, e.g. `❤️ 47 · 🔥 12 · 💬 8`.
@@ -142,8 +183,10 @@ fn split_desc(s: &str, limit: usize) -> Vec<String> {
 /// The body becomes the description, split across multiple embeds when it
 /// exceeds [`EMBED_DESC_LIMIT`] (capped at [`MAX_EMBEDS`]). The first embed
 /// carries the author (channel title + optional avatar/deep-link); the last
-/// carries the stats line, the masked `↗ View on Telegram` link, and the
-/// `by zayd — {variant}` footer.
+/// carries the stats line, the masked `↗ View on Telegram` link, the
+/// `by zayd — {variant}` footer, and the source post's timestamp (Discord
+/// renders it beside the footer). The stripe `color` is set on EVERY embed so a
+/// split post reads as one block rather than a colored head and gray tail.
 pub fn embed(post: &RelayText, meta: &EmbedMeta) -> Value {
     let mut body = String::new();
     if post.edited {
@@ -173,7 +216,7 @@ pub fn embed(post: &RelayText, meta: &EmbedMeta) -> Value {
     let last = chunks.len() - 1;
     let mut embeds = Vec::with_capacity(chunks.len());
     for (i, chunk) in chunks.into_iter().enumerate() {
-        let mut e = json!({ "description": chunk });
+        let mut e = json!({ "description": chunk, "color": meta.color });
 
         if i == 0 {
             let mut author = json!({ "name": meta.title });
@@ -202,6 +245,9 @@ pub fn embed(post: &RelayText, meta: &EmbedMeta) -> Value {
                 e["fields"] = json!([{ "name": "\u{200b}", "value": value, "inline": false }]);
             }
             e["footer"] = json!({ "text": format!("by zayd — {}", footer_variant()) });
+            if let Some(ts) = &meta.timestamp {
+                e["timestamp"] = json!(ts);
+            }
         }
 
         embeds.push(e);
@@ -353,6 +399,8 @@ mod tests {
             reactions: reactions(&[("❤️", 47), ("🔥", 12)]),
             comment_count: 8,
             deleted: false,
+            color: DEFAULT_EMBED_COLOR,
+            timestamp: Some("2026-07-20T12:00:00Z".into()),
         }
     }
 
@@ -415,6 +463,73 @@ mod tests {
         let field_val = e["fields"][0]["value"].as_str().unwrap();
         assert!(field_val.contains("❤️ 47 · 🔥 12 · 💬 8"));
         assert!(field_val.contains("[↗ View on Telegram](https://t.me/robthinks/42)"));
+    }
+
+    #[test]
+    fn embed_carries_color_and_source_timestamp() {
+        let out = embed(&rt("gm frens"), &meta());
+        let e = &out[0];
+        // Discord wants a decimal int, not a "#RRGGBB" string.
+        assert_eq!(e["color"], json!(DEFAULT_EMBED_COLOR));
+        assert_eq!(e["color"].as_u64(), Some(2733814)); // 0x29B6F6
+        assert_eq!(e["timestamp"], "2026-07-20T12:00:00Z");
+    }
+
+    #[test]
+    fn embed_honors_custom_color() {
+        let mut m = meta();
+        m.color = 0xFF0000;
+        let out = embed(&rt("red"), &m);
+        assert_eq!(out[0]["color"].as_u64(), Some(0xFF0000));
+    }
+
+    #[test]
+    fn embed_omits_timestamp_when_unknown() {
+        let mut m = meta();
+        m.timestamp = None;
+        let out = embed(&rt("no clock"), &m);
+        assert!(out[0].get("timestamp").is_none());
+        // ...but the stripe is still there.
+        assert_eq!(out[0]["color"].as_u64(), Some(DEFAULT_EMBED_COLOR as u64));
+    }
+
+    #[test]
+    fn split_embeds_all_share_color_but_timestamp_rides_the_last() {
+        let big = "x".repeat(EMBED_DESC_LIMIT * 2 + 10);
+        let out = embed(&rt(&big), &meta());
+        let arr = out.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert!(
+            arr.iter()
+                .all(|e| e["color"].as_u64() == Some(DEFAULT_EMBED_COLOR as u64)),
+            "every chunk must carry the stripe, not just the first"
+        );
+        assert!(arr[0].get("timestamp").is_none());
+        assert!(arr[1].get("timestamp").is_none());
+        assert_eq!(arr[2]["timestamp"], "2026-07-20T12:00:00Z");
+    }
+
+    #[test]
+    fn default_embed_meta_is_neon_blue_not_black() {
+        // A derived Default would silently yield 0x000000 here.
+        assert_eq!(EmbedMeta::default().color, DEFAULT_EMBED_COLOR);
+        assert_ne!(EmbedMeta::default().color, 0);
+    }
+
+    #[test]
+    fn embed_timestamp_formats_rfc3339_utc_seconds() {
+        use chrono::TimeZone;
+        let dt = chrono::Utc.with_ymd_and_hms(2026, 7, 20, 18, 4, 5).unwrap();
+        assert_eq!(embed_timestamp(dt), "2026-07-20T18:04:05Z");
+    }
+
+    #[test]
+    fn embed_timestamp_truncates_subsecond_precision() {
+        use chrono::TimeZone;
+        let dt = chrono::Utc.timestamp_millis_opt(1_753_000_000_123).unwrap();
+        let s = embed_timestamp(dt);
+        assert!(s.ends_with('Z'), "expected a Z-suffixed UTC stamp: {s}");
+        assert!(!s.contains('.'), "sub-second precision leaked: {s}");
     }
 
     #[test]

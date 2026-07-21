@@ -36,6 +36,24 @@ pub struct RouteCfg {
     pub from: ChatRef,
     pub to: Vec<WebhookName>,
     pub filter: Option<Filter>,
+    /// Embed stripe color as a 24-bit RGB integer, already parsed from the
+    /// optional `color: "#RRGGBB"` key (defaults to [`DEFAULT_EMBED_COLOR`]).
+    pub color: u32,
+}
+
+/// Parse a `#RRGGBB` (or bare `RRGGBB`) hex color into a 24-bit RGB integer.
+///
+/// Strict by design — this runs at config load so a typo fails the boot with
+/// the offending route named, rather than silently rendering a black stripe.
+/// Exactly six hex digits: no 3-digit shorthand, no alpha channel, no named
+/// colors. YAML treats an unquoted `#` as a comment, so `color: "#29B6F6"`
+/// must be quoted; the bare form is accepted for the people who forget.
+pub fn parse_hex_color(s: &str) -> Option<u32> {
+    let hex = s.strip_prefix('#').unwrap_or(s);
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(hex, 16).ok()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +126,8 @@ pub enum ConfigError {
     EmptyTo { route: String },
     #[error("route '{route}': 'from' must be a string or integer, got {got}")]
     InvalidFrom { route: String, got: String },
+    #[error("route '{route}': invalid color '{got}'; expected a quoted \"#RRGGBB\" hex string")]
+    InvalidColor { route: String, got: String },
 }
 
 // ---- raw (serde) layer: never leaves this module ----
@@ -153,6 +173,8 @@ mod raw {
         pub from: serde_yaml::Value, // "@name" | "name" | -100123
         pub to: Vec<String>,
         pub filter: Option<Filter>,
+        #[serde(default)]
+        pub color: Option<String>, // "#RRGGBB"
     }
     #[derive(Deserialize, Default)]
     pub struct Filter {
@@ -236,6 +258,13 @@ impl Config {
                     })
                 }
             };
+            let color = match &r.color {
+                None => crate::render::DEFAULT_EMBED_COLOR,
+                Some(raw) => parse_hex_color(raw).ok_or_else(|| ConfigError::InvalidColor {
+                    route: r.name.clone(),
+                    got: raw.clone(),
+                })?,
+            };
             routes.push(RouteCfg {
                 name: r.name,
                 from,
@@ -244,6 +273,7 @@ impl Config {
                     any_keywords: f.any_keywords,
                     exclude_hashtags: f.exclude_hashtags,
                 }),
+                color,
             });
         }
 
@@ -375,6 +405,74 @@ mod tests {
         assert!(
             e.contains("'from'") && e.contains("from"),
             "error should mention 'from' field: {e}"
+        );
+    }
+
+    #[test]
+    fn parse_hex_color_accepts_valid_forms() {
+        assert_eq!(parse_hex_color("#29B6F6"), Some(0x29B6F6));
+        assert_eq!(parse_hex_color("29B6F6"), Some(0x29B6F6)); // bare, no '#'
+        assert_eq!(parse_hex_color("#000000"), Some(0));
+        assert_eq!(parse_hex_color("#ffffff"), Some(0xFFFFFF)); // lowercase ok
+        assert_eq!(parse_hex_color("#FfEeDd"), Some(0xFFEEDD)); // mixed case ok
+    }
+
+    #[test]
+    fn parse_hex_color_rejects_malformed() {
+        assert_eq!(parse_hex_color(""), None);
+        assert_eq!(parse_hex_color("#"), None);
+        assert_eq!(parse_hex_color("#29B6F"), None); // 5 digits
+        assert_eq!(parse_hex_color("#29B6F6F"), None); // 7 digits
+        assert_eq!(parse_hex_color("#FFF"), None); // no 3-digit shorthand
+        assert_eq!(parse_hex_color("#GGGGGG"), None); // non-hex
+        assert_eq!(parse_hex_color("#29B6F6\n"), None); // trailing junk
+        assert_eq!(parse_hex_color("blue"), None); // named color
+        assert_eq!(parse_hex_color("#29B6F6ff"), None); // 8-digit rgba
+    }
+
+    #[test]
+    fn color_defaults_to_neon_blue_when_unset() {
+        std::env::set_var(
+            "TEST_HOOK_COLOR_DEF",
+            "https://discord.com/api/webhooks/1/x",
+        );
+        let p = write_tmp(
+            "color_default",
+            "routes:\n  - name: r1\n    from: \"@c\"\n    to: [h1]\nwebhooks:\n  h1: { env: TEST_HOOK_COLOR_DEF }\nmedia: { mode: reupload, max_bytes: 1000 }\n",
+        );
+        let c = Config::load(&p).unwrap();
+        assert_eq!(c.routes[0].color, crate::render::DEFAULT_EMBED_COLOR);
+    }
+
+    #[test]
+    fn color_override_parses_to_u32() {
+        std::env::set_var(
+            "TEST_HOOK_COLOR_OVR",
+            "https://discord.com/api/webhooks/1/x",
+        );
+        let p = write_tmp(
+            "color_override",
+            "routes:\n  - name: r1\n    from: \"@c\"\n    to: [h1]\n    color: \"#FF8800\"\nwebhooks:\n  h1: { env: TEST_HOOK_COLOR_OVR }\nmedia: { mode: reupload, max_bytes: 1000 }\n",
+        );
+        let c = Config::load(&p).unwrap();
+        assert_eq!(c.routes[0].color, 0xFF8800);
+    }
+
+    #[test]
+    fn malformed_color_rejected_naming_the_route() {
+        std::env::set_var(
+            "TEST_HOOK_COLOR_BAD",
+            "https://discord.com/api/webhooks/1/x",
+        );
+        let p = write_tmp(
+            "color_bad",
+            "routes:\n  - name: neon-route\n    from: \"@c\"\n    to: [h1]\n    color: \"not-a-color\"\nwebhooks:\n  h1: { env: TEST_HOOK_COLOR_BAD }\nmedia: { mode: reupload, max_bytes: 1000 }\n",
+        );
+        let e = Config::load(&p).unwrap_err().to_string();
+        assert!(e.contains("neon-route"), "error should name the route: {e}");
+        assert!(
+            e.contains("not-a-color"),
+            "error should echo the bad value: {e}"
         );
     }
 

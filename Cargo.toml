@@ -28,6 +28,13 @@ arc-swap = "1"
 # state fully separate from libsql's.
 rusqlite = "0.32"
 rand = "0.8"
+# Already in the tree via grammers (Message::date() -> chrono::DateTime<Utc>);
+# named directly here because we format that value into the embed `timestamp`.
+# default-features = false keeps it to the types + RFC3339 formatting we use —
+# we never call Utc::now(), so the `clock` feature is not ours to request.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+# Discord's webhook-avatar PATCH takes a base64 data: URI.
+base64 = "0.22"
 
 [dev-dependencies]
 axum = "0.8"

@@ -1,0 +1,12 @@
+[Unit]
+Description=Post a Discord ops alert when %i fails
+# Fired via OnFailure= from telegram-relay.service. Kept as a separate unit so a
+# failing alert can never take the relay down with it.
+
+[Service]
+Type=oneshot
+User=zaydk
+WorkingDirectory=/home/zaydk/telegram-relay
+# The script reads DISCORD_WEBHOOK_OPS out of the gitignored .env itself, so the
+# webhook token never appears in this unit file or in systemd's environment.
+ExecStart=/home/zaydk/telegram-relay/deploy/relay-alert.sh %i

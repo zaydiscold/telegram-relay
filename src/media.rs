@@ -30,6 +30,12 @@ pub struct MediaTarget {
     pub webhook: WebhookName,
     /// Resolved webhook URL.
     pub url: WebhookUrl,
+    /// Embed stripe color configured on `route`. Carried per target (rather
+    /// than once per album) so the color posted matches the color the refresh
+    /// worker later re-derives from the recorded row's route — otherwise a
+    /// media post fanned out to routes with different colors would flip on its
+    /// first reaction update.
+    pub color: u32,
 }
 
 /// One downloaded media file ready to post, with its routing/context attached.
@@ -59,6 +65,8 @@ pub struct MediaItem {
     pub title: String,
     /// Message sender display name, if any (for the webhook username).
     pub sender: Option<String>,
+    /// The source message's ORIGINAL Telegram publish time, RFC3339.
+    pub date: String,
     /// Distinct routes×webhooks this album should fan out to.
     pub targets: Vec<MediaTarget>,
 }
@@ -154,10 +162,12 @@ mod tests {
             deep_link: None,
             title: "tester".into(),
             sender: None,
+            date: "2026-07-20T12:00:00Z".into(),
             targets: vec![MediaTarget {
                 route: "r1".into(),
                 webhook: WebhookName("hook".into()),
                 url: WebhookUrl("https://example.invalid/webhook".into()),
+                color: crate::render::DEFAULT_EMBED_COLOR,
             }],
         }
     }

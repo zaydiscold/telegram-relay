@@ -175,6 +175,7 @@ pub async fn resolve_routes(client: &Client, cfg: &Config) -> anyhow::Result<Res
             chat,
             to: route.to.clone(),
             filter: route.filter.clone(),
+            color: route.color,
         });
     }
     Ok(Resolution {
@@ -279,6 +280,9 @@ pub enum Incoming {
         title: Option<String>,
         /// `t.me` deep link to this message, if the chat has a public username.
         deep_link: Option<String>,
+        /// The message's ORIGINAL Telegram publish time, RFC3339, for the
+        /// embed `timestamp` field.
+        date: String,
     },
     Media {
         chat: ChatId,
@@ -291,6 +295,9 @@ pub enum Incoming {
         deep_link: Option<String>,
         /// Channel/chat title, for the embed author (same as the text path).
         title: Option<String>,
+        /// The message's ORIGINAL Telegram publish time, RFC3339 (same as the
+        /// text path).
+        date: String,
     },
 }
 
@@ -535,6 +542,10 @@ pub fn classify(update: Update) -> Option<Incoming> {
         .peer()
         .and_then(|p| p.username())
         .map(|u| format!("https://t.me/{u}/{msg_id}"));
+    // The SOURCE post time, not our relay time. For an edit this is still the
+    // original publish date (grammers exposes the edit time separately via
+    // `edit_date()`), which is what we want on the embed.
+    let date = crate::render::embed_timestamp(message.date());
 
     match routing {
         // Already handled above; kept exhaustive for the compiler.
@@ -550,6 +561,7 @@ pub fn classify(update: Update) -> Option<Incoming> {
             edited,
             title,
             deep_link,
+            date,
         }),
         Routing::File => {
             let media = message
@@ -566,6 +578,7 @@ pub fn classify(update: Update) -> Option<Incoming> {
                 approx_size,
                 deep_link,
                 title,
+                date,
             })
         }
     }

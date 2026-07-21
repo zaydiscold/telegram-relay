@@ -9,6 +9,8 @@ pub struct ResolvedRoute {
     pub chat: ChatId,
     pub to: Vec<WebhookName>,
     pub filter: Option<Filter>,
+    /// Embed stripe color for posts relayed by this route.
+    pub color: u32,
 }
 
 pub struct Router(HashMap<ChatId, Vec<ResolvedRoute>>);
@@ -37,6 +39,7 @@ mod tests {
             chat: ChatId(5),
             to: vec![WebhookName("h".into())],
             filter: None,
+            color: crate::render::DEFAULT_EMBED_COLOR,
         }]);
         assert_eq!(r.match_chat(ChatId(5)).len(), 1);
         assert!(r.match_chat(ChatId(6)).is_empty());
@@ -49,6 +52,7 @@ mod tests {
             chat: ChatId(5),
             to: vec![WebhookName(n.into())],
             filter: None,
+            color: crate::render::DEFAULT_EMBED_COLOR,
         };
         let r = Router::new(vec![mk("a"), mk("b")]);
         assert_eq!(r.match_chat(ChatId(5)).len(), 2);

@@ -39,6 +39,9 @@ pub struct NewRecord {
 pub struct TrackedMsg {
     pub chat_id: i64,
     pub tg_msg_id: i32,
+    /// Config route name this was relayed by — carried so the refresh worker can
+    /// look the route's embed color back up when it PATCHes.
+    pub route: String,
     pub webhook_name: String,
     pub discord_msg_id: String,
     pub content_hash: String,
@@ -197,7 +200,7 @@ impl Store {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = conn.prepare(
             r#"
-            SELECT chat_id, tg_msg_id, webhook_name, discord_msg_id,
+            SELECT chat_id, tg_msg_id, route, webhook_name, discord_msg_id,
                    content_hash, reactions, comment_count
             FROM relayed
             WHERE deleted = 0 AND posted_at >= ?1
@@ -208,11 +211,12 @@ impl Store {
             Ok(TrackedMsg {
                 chat_id: r.get(0)?,
                 tg_msg_id: r.get(1)?,
-                webhook_name: r.get(2)?,
-                discord_msg_id: r.get(3)?,
-                content_hash: r.get(4)?,
-                reactions: reactions_from_json(&r.get::<_, String>(5)?),
-                comment_count: r.get(6)?,
+                route: r.get(2)?,
+                webhook_name: r.get(3)?,
+                discord_msg_id: r.get(4)?,
+                content_hash: r.get(5)?,
+                reactions: reactions_from_json(&r.get::<_, String>(6)?),
+                comment_count: r.get(7)?,
             })
         })?;
         let mut out = Vec::new();

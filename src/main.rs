@@ -345,6 +345,7 @@ async fn backfill(
             route: route.name.clone(),
             webhook: name.clone(),
             url: url.clone(),
+            color: route.color,
         })
         .collect();
     let placeholder = cfg.media.mode == MediaMode::Placeholder;
@@ -446,6 +447,7 @@ async fn backfill(
                     sender.as_deref(),
                     &fetched.reactions,
                     fetched.comment_count,
+                    fetched.date.as_deref(),
                     &files,
                     &media_targets,
                 )
@@ -494,6 +496,8 @@ async fn backfill(
             reactions: fetched.reactions.clone(),
             comment_count: fetched.comment_count,
             deleted: false,
+            color: route.color,
+            timestamp: fetched.date.clone(),
         };
         let embeds = render::embed(&text, &meta);
         // Hash the RAW caption so the refresh worker (which hashes msg.text())
@@ -707,9 +711,17 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
         let store = store.clone();
         let deliverer = deliverer.clone();
         let webhooks = cfg.webhooks.clone();
+        // Route -> embed color, so a PATCH re-declares the stripe instead of
+        // dropping it to Discord's gray. Snapshotted with the webhook map, so a
+        // color changed at runtime applies to refreshes only after a restart.
+        let colors: refresh::RouteColors = cfg
+            .routes
+            .iter()
+            .map(|r| (r.name.clone(), r.color))
+            .collect();
         let refresh_cfg = cfg.refresh;
         tokio::spawn(async move {
-            refresh::run(fetcher, store, deliverer, webhooks, refresh_cfg).await;
+            refresh::run(fetcher, store, deliverer, webhooks, colors, refresh_cfg).await;
         });
         info!(
             interval_mins = cfg.refresh.interval_mins,
@@ -869,6 +881,7 @@ async fn handle_update(
             edited,
             title,
             deep_link,
+            date,
             ..
         } => {
             for route in routes {
@@ -893,6 +906,8 @@ async fn handle_update(
                     reactions: Default::default(),
                     comment_count: 0,
                     deleted: false,
+                    color: route.color,
+                    timestamp: Some(date.clone()),
                 };
                 let embeds = render::embed(&text, &meta);
                 let hash = content_hash(&body);
@@ -926,6 +941,7 @@ async fn handle_update(
             approx_size,
             deep_link,
             title,
+            date,
             ..
         } => {
             // Union of every matching route's webhooks (filter on caption),
@@ -946,6 +962,7 @@ async fn handle_update(
                             route: route.name.clone(),
                             webhook: name,
                             url,
+                            color: route.color,
                         });
                     }
                 }
@@ -978,16 +995,22 @@ async fn handle_update(
                     reply_quote: None,
                     edited: false,
                 };
-                let meta = EmbedMeta {
-                    title,
-                    avatar_url: None,
-                    deep_link: deep_link.clone(),
-                    reactions: Default::default(),
-                    comment_count: 0,
-                    deleted: false,
-                };
-                let embeds = render::embed(&text, &meta);
                 for t in targets {
+                    // Built per target: the stripe color is the *route's*, and
+                    // the refresh worker re-derives it from the recorded row's
+                    // route, so posting one shared embed would let a multi-route
+                    // fan-out flip color on its first PATCH.
+                    let meta = EmbedMeta {
+                        title: title.clone(),
+                        avatar_url: None,
+                        deep_link: deep_link.clone(),
+                        reactions: Default::default(),
+                        comment_count: 0,
+                        deleted: false,
+                        color: t.color,
+                        timestamp: Some(date.clone()),
+                    };
+                    let embeds = render::embed(&text, &meta);
                     let username = display_name(sender.as_deref(), &t.route);
                     spawn_embed(
                         deliverer.clone(),
@@ -1005,7 +1028,7 @@ async fn handle_update(
                             comment_count: 0,
                         },
                         username,
-                        embeds.clone(),
+                        embeds,
                     );
                 }
                 return;
@@ -1039,6 +1062,7 @@ async fn handle_update(
                     deep_link,
                     title,
                     sender,
+                    date,
                     targets,
                 };
                 // Never block the download task on a full channel: on
@@ -1126,6 +1150,7 @@ async fn flush_album(deliverer: &Deliverer, ops: &Ops, store: &Store, batch: Vec
         album.sender.as_deref(),
         &std::collections::BTreeMap::new(),
         0,
+        Some(album.date.as_str()),
         &album.files,
         &album.targets,
     )
@@ -1141,6 +1166,8 @@ struct CoalescedAlbum {
     caption: String,
     deep_link: Option<String>,
     sender: Option<String>,
+    /// The anchor message's ORIGINAL Telegram publish time, RFC3339.
+    date: String,
     files: Vec<(String, Vec<u8>)>,
     targets: Vec<MediaTarget>,
 }
@@ -1170,11 +1197,25 @@ fn coalesce_album(mut batch: Vec<MediaItem>) -> Option<CoalescedAlbum> {
 
     // Anchor = the caption-bearing message (its msg_id keys the store row +
     // content hash); fall back to the lowest msg_id for a captionless album.
-    let (anchor_msg_id, caption, deep_link) = batch
+    let (anchor_msg_id, caption, deep_link, date) = batch
         .iter()
         .find(|i| !i.caption.trim().is_empty())
-        .map(|i| (i.msg_id, i.caption.clone(), i.deep_link.clone()))
-        .unwrap_or_else(|| (batch[0].msg_id, String::new(), batch[0].deep_link.clone()));
+        .map(|i| {
+            (
+                i.msg_id,
+                i.caption.clone(),
+                i.deep_link.clone(),
+                i.date.clone(),
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                batch[0].msg_id,
+                String::new(),
+                batch[0].deep_link.clone(),
+                batch[0].date.clone(),
+            )
+        });
 
     // Union of distinct targets across every item, deduped by webhook name.
     let mut targets: Vec<MediaTarget> = Vec::new();
@@ -1194,6 +1235,7 @@ fn coalesce_album(mut batch: Vec<MediaItem>) -> Option<CoalescedAlbum> {
         caption,
         deep_link,
         sender: batch[0].sender.clone(),
+        date,
         files,
         targets,
     })
@@ -1219,26 +1261,16 @@ async fn deliver_coalesced_media(
     sender: Option<&str>,
     reactions: &std::collections::BTreeMap<String, i32>,
     comment_count: i32,
+    timestamp: Option<&str>,
     files: &[(String, Vec<u8>)],
     targets: &[MediaTarget],
 ) -> (usize, usize, usize) {
-    // The embed is identical for every target (only the webhook username, passed
-    // separately to post_media_embed, varies), so build it once.
     let text = RelayText {
         sender: None,
         body: caption.to_string(),
         reply_quote: None,
         edited: false,
     };
-    let meta = EmbedMeta {
-        title: title.to_string(),
-        avatar_url: None,
-        deep_link: deep_link.map(|s| s.to_string()),
-        reactions: reactions.clone(),
-        comment_count,
-        deleted: false,
-    };
-    let embeds = render::embed(&text, &meta);
     // Hash the RAW caption: the refresh worker recomputes the hash from the
     // anchor message's text alone, so this matches and avoids a spurious edit.
     let hash = content_hash(caption);
@@ -1261,6 +1293,21 @@ async fn deliver_coalesced_media(
                 warn!(error = %e, chat = chat_id, msg_id = anchor_msg_id, "media dedup check failed; posting anyway")
             }
         }
+
+        // Built per target: the stripe color is the *route's*, and the refresh
+        // worker re-derives it from the recorded row's route, so one shared
+        // embed would let a multi-route fan-out flip color on its first PATCH.
+        let meta = EmbedMeta {
+            title: title.to_string(),
+            avatar_url: None,
+            deep_link: deep_link.map(|s| s.to_string()),
+            reactions: reactions.clone(),
+            comment_count,
+            deleted: false,
+            color: t.color,
+            timestamp: timestamp.map(|s| s.to_string()),
+        };
+        let embeds = render::embed(&text, &meta);
 
         let username = display_name(sender, &t.route);
         match deliverer
@@ -1408,12 +1455,14 @@ mod album_coalesce_tests {
             deep_link: Some(format!("https://t.me/c/{msg_id}")),
             title: "Rob's Channel".into(),
             sender: None,
+            date: format!("2026-07-20T12:00:{msg_id:02}Z"),
             targets: hooks
                 .iter()
                 .map(|h| MediaTarget {
                     route: "r1".into(),
                     webhook: WebhookName(h.to_string()),
                     url: WebhookUrl(format!("https://discord.example/{h}")),
+                    color: render::DEFAULT_EMBED_COLOR,
                 })
                 .collect(),
         }
@@ -1479,6 +1528,29 @@ mod album_coalesce_tests {
     #[test]
     fn empty_batch_is_none() {
         assert!(coalesce_album(vec![]).is_none());
+    }
+
+    #[test]
+    fn coalesce_anchors_date_on_the_caption_bearing_member() {
+        // The album's timestamp must follow the caption/anchor member (msg 102),
+        // not the first-downloaded item — the whole point is the SOURCE post
+        // time, and the anchor is the message whose id keys the store row.
+        let batch = vec![
+            media_item(103, "", &["alpha"]),
+            media_item(102, "the caption", &["alpha"]),
+            media_item(101, "", &["alpha"]),
+        ];
+        let album = coalesce_album(batch).expect("non-empty batch");
+        assert_eq!(album.anchor_msg_id, 102);
+        assert_eq!(album.date, "2026-07-20T12:00:102Z");
+    }
+
+    #[test]
+    fn coalesce_targets_preserve_route_color() {
+        let mut a = media_item(101, "cap", &["alpha"]);
+        a.targets[0].color = 0xFF8800;
+        let album = coalesce_album(vec![a]).expect("non-empty batch");
+        assert_eq!(album.targets[0].color, 0xFF8800);
     }
 }
 

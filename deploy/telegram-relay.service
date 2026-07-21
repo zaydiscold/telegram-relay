@@ -3,6 +3,9 @@ Description=Telegram to Discord relay
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
+# Post a Discord ops alert when the relay fails. Separate unit so a failing
+# alert can never take the relay down with it.
+OnFailure=telegram-relay-alert@%n.service
 
 [Service]
 User=zaydk
@@ -10,7 +13,10 @@ WorkingDirectory=/home/zaydk/telegram-relay
 ExecStart=/home/zaydk/telegram-relay/target/release/telegram-relay run
 Restart=always
 RestartSec=2
-Environment=RUST_LOG=info
+# Our logs at info; grammers' MTProto internals (salt rotation, reconnect
+# chatter) at warn. At info they dominate the journal and are the main driver
+# of long-term log growth.
+Environment=RUST_LOG=info,grammers_mtproto=warn,grammers_mtsender=warn,grammers_session=warn
 NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths=/home/zaydk/telegram-relay

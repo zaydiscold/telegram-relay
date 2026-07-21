@@ -48,6 +48,9 @@ pub struct FetchedPost {
     pub deep_link: Option<String>,
     pub reactions: BTreeMap<String, i32>,
     pub comment_count: i32,
+    /// ORIGINAL Telegram publish time, RFC3339. Re-read on every fetch so a
+    /// PATCHed embed keeps the source timestamp instead of losing it.
+    pub date: Option<String>,
 }
 
 /// Fetch tracked messages by id for a chat. Behind a trait so the diff/apply
@@ -101,6 +104,7 @@ pub fn to_fetched(msg: &grammers_client::message::Message) -> FetchedPost {
         deep_link,
         reactions: extract_reactions(msg),
         comment_count: msg.reply_count().unwrap_or(0),
+        date: Some(render::embed_timestamp(msg.date())),
     }
 }
 
@@ -183,12 +187,29 @@ pub fn diff(tracked: &TrackedMsg, fetched: Option<&FetchedPost>) -> RefreshActio
     }
 }
 
+/// Per-route embed stripe colors, snapshotted at startup.
+///
+/// A PATCHed embed must re-declare `color` — Discord replaces the whole embed
+/// object, so omitting it would drop the stripe to gray on the very first
+/// reaction update. Routes missing from the map (added after startup, or rows
+/// left by an older config) fall back to [`render::DEFAULT_EMBED_COLOR`].
+pub type RouteColors = HashMap<String, u32>;
+
+/// Look up a route's stripe color, falling back to the default.
+pub fn color_for(colors: &RouteColors, route: &str) -> u32 {
+    colors
+        .get(route)
+        .copied()
+        .unwrap_or(render::DEFAULT_EMBED_COLOR)
+}
+
 /// The interval worker. Runs until the process ends.
 pub async fn run<F: PostFetcher>(
     fetcher: F,
     store: Arc<Store>,
     deliverer: Arc<Deliverer>,
     webhooks: HashMap<WebhookName, WebhookUrl>,
+    colors: RouteColors,
     cfg: RefreshCfg,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_secs(cfg.interval_mins * 60));
@@ -198,18 +219,20 @@ pub async fn run<F: PostFetcher>(
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        if let Err(e) = tick_once(&fetcher, &store, &deliverer, &webhooks, &cfg).await {
+        if let Err(e) = tick_once(&fetcher, &store, &deliverer, &webhooks, &colors, &cfg).await {
             warn!(error = %e, "refresh tick failed");
         }
     }
 }
 
 /// A single refresh pass: fetch due posts per chat, apply diffs, then prune.
+#[allow(clippy::too_many_arguments)]
 pub async fn tick_once<F: PostFetcher>(
     fetcher: &F,
     store: &Arc<Store>,
     deliverer: &Arc<Deliverer>,
     webhooks: &HashMap<WebhookName, WebhookUrl>,
+    colors: &RouteColors,
     cfg: &RefreshCfg,
 ) -> Result<()> {
     let due = store.due(cfg.horizon_hours)?;
@@ -252,7 +275,17 @@ pub async fn tick_once<F: PostFetcher>(
                 continue;
             };
             let action = diff(&row, slot.as_ref());
-            if let Err(e) = apply(&action, &row, slot.as_ref(), store, deliverer, webhooks).await {
+            if let Err(e) = apply(
+                &action,
+                &row,
+                slot.as_ref(),
+                store,
+                deliverer,
+                webhooks,
+                colors,
+            )
+            .await
+            {
                 warn!(chat_id, tg = row.tg_msg_id, error = %e, "applying refresh failed");
             }
         }
@@ -266,6 +299,11 @@ pub async fn tick_once<F: PostFetcher>(
 }
 
 /// Apply a single diff result: PATCH Discord + update the store.
+///
+/// A PATCH replaces the embed wholesale, so `color` (and, where recoverable,
+/// `timestamp`) must be re-declared on every rebuild here — otherwise the first
+/// reaction update would strip the stripe and the source time off the post.
+#[allow(clippy::too_many_arguments)]
 async fn apply(
     action: &RefreshAction,
     row: &TrackedMsg,
@@ -273,6 +311,7 @@ async fn apply(
     store: &Arc<Store>,
     deliverer: &Arc<Deliverer>,
     webhooks: &HashMap<WebhookName, WebhookUrl>,
+    colors: &RouteColors,
 ) -> Result<()> {
     if *action == RefreshAction::None {
         return Ok(());
@@ -281,6 +320,7 @@ async fn apply(
         warn!(hook = %row.webhook_name, "refresh: unknown webhook; skipping patch");
         return Ok(());
     };
+    let color = color_for(colors, &row.route);
 
     match action {
         RefreshAction::None => {}
@@ -300,6 +340,11 @@ async fn apply(
                 reactions: row.reactions.clone(),
                 comment_count: row.comment_count,
                 deleted: true,
+                color,
+                // The source is gone, so its publish time is no longer
+                // fetchable and the store does not keep it — the tombstone
+                // drops the timestamp the same way it drops title and body.
+                timestamp: None,
             };
             let embed = render::embed(&text, &meta);
             patch(deliverer, url, &row.discord_msg_id, embed).await;
@@ -320,6 +365,8 @@ async fn apply(
                 reactions: f.reactions.clone(),
                 comment_count: f.comment_count,
                 deleted: false,
+                color,
+                timestamp: f.date.clone(),
             };
             let embed = render::embed(&text, &meta);
             patch(deliverer, url, &row.discord_msg_id, embed).await;
@@ -359,6 +406,7 @@ mod tests {
         TrackedMsg {
             chat_id: 1,
             tg_msg_id: 5,
+            route: "r1".into(),
             webhook_name: "hook".into(),
             discord_msg_id: "d1".into(),
             content_hash: content_hash(body),
@@ -374,6 +422,7 @@ mod tests {
             deep_link: Some("https://t.me/c/5".into()),
             reactions: map(reactions),
             comment_count: comments,
+            date: Some("2026-07-20T12:00:00Z".into()),
         }
     }
 
