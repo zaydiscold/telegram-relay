@@ -27,8 +27,20 @@ Windows powers on
                       └─ ./target/release/telegram-relay run
 ```
 
-If the process dies, systemd restarts it in ~2s. If WSL drops, the scheduled
-task brings it back. If the box reboots, the whole chain re-arms itself.
+If the process dies, systemd restarts it in ~2s (verified: SIGKILL test, back in
+<6s). If WSL drops, the scheduled task brings it back. If the box reboots, the
+whole chain re-arms itself — **each link individually confirmed correct**:
+- `telegram-relay.service`: `enabled` (`systemctl is-enabled`)
+- WSL: `[boot] systemd=true` in `/etc/wsl.conf`
+- Task Scheduler: `WSL-keepalive-telegram-relay`, trigger `MSFT_TaskBootTrigger`
+  (Enabled=True), principal `LogonType=S4U` (runs without an interactive login),
+  `ExecutionTimeLimit=PT0S` (unlimited — Windows won't kill it after 72h)
+
+⚠️ **Not yet exercised by an actual reboot.** Every link checks out individually,
+but mothership hasn't cold-booted since this was wired up
+(`Get-ScheduledTaskInfo` shows `LastRunTime` at its "never run" sentinel). Verify
+with `Restart-Computer -Force` on mothership (heads up: this restarts its other
+services too) and re-check `systemctl is-active telegram-relay` after boot.
 
 ## What it watches (routes)
 
