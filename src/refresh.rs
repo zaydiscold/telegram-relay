@@ -23,8 +23,6 @@
 //!
 //! No reaction/comment data had to be stubbed — it is all reachable.
 
-#![allow(dead_code)]
-
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;

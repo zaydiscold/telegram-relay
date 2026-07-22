@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::config::{ChatId, Filter, MediaMode, WebhookName};
 use std::collections::HashMap;
 

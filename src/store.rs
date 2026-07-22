@@ -11,8 +11,6 @@
 //! runs in WAL mode and is guarded by a `Mutex` so the store is `Send + Sync`
 //! and can be shared (via `Arc`) between the hot path and the refresh worker.
 
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Mutex;

@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::config::ChatId;
 use lru::LruCache;
 use std::num::NonZeroUsize;
