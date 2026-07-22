@@ -237,6 +237,7 @@ pub async fn resolve_routes(client: &Client, cfg: &Config) -> anyhow::Result<Res
             to: route.to.clone(),
             filter: route.filter.clone(),
             color: route.color,
+            media_mode: route.media_mode,
         });
     }
     Ok(Resolution {

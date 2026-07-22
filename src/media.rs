@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use crate::config::{ChatId, WebhookName, WebhookUrl};
+use crate::config::{ChatId, MediaMode, WebhookName, WebhookUrl};
 
 /// A resolved fan-out target for a media post: which route selected it and the
 /// named webhook to deliver to. The webhook *name* is required so the post can
@@ -36,6 +36,11 @@ pub struct MediaTarget {
     /// media post fanned out to routes with different colors would flip on its
     /// first reaction update.
     pub color: u32,
+    /// Effective media mode for THIS target's route (route override or the
+    /// global default). A `Placeholder` target gets a t.me deep-link notice with
+    /// no file even when a sibling reupload target on the same album uploads the
+    /// bytes. (queued-polish §11c)
+    pub mode: MediaMode,
 }
 
 /// One downloaded media file ready to post, with its routing/context attached.
@@ -53,10 +58,15 @@ pub struct MediaItem {
     pub msg_id: i32,
     /// Source chat.
     pub chat: ChatId,
-    /// Filename to present on the uploaded attachment.
-    pub filename: String,
-    /// The already-downloaded file bytes.
-    pub bytes: Vec<u8>,
+    /// The downloaded file `(filename, bytes)`, or `None` for a sibling we
+    /// intentionally did not download — oversized, or every target is
+    /// placeholder mode. A file-less item still enters the album so the group
+    /// coalesces as a unit and the caption stays anchored to the right message
+    /// (queued-polish §10a).
+    pub file: Option<(String, Vec<u8>)>,
+    /// Whether this message's media exceeded `media.max_bytes`. Drives the
+    /// "[media too large to relay]" vs "[media]" notice text at delivery.
+    pub oversized: bool,
     /// Caption text (only the caption-bearing message of an album has one).
     pub caption: String,
     /// t.me deep link to this message, if the chat has a public username.
@@ -156,8 +166,8 @@ mod tests {
             grouped_id,
             msg_id,
             chat: ChatId(1),
-            filename: format!("f{msg_id}.bin"),
-            bytes: vec![0u8, 1, 2, 3],
+            file: Some((format!("f{msg_id}.bin"), vec![0u8, 1, 2, 3])),
+            oversized: false,
             caption: String::new(),
             deep_link: None,
             title: "tester".into(),
@@ -168,6 +178,7 @@ mod tests {
                 webhook: WebhookName("hook".into()),
                 url: WebhookUrl("https://example.invalid/webhook".into()),
                 color: crate::render::DEFAULT_EMBED_COLOR,
+                mode: MediaMode::Reupload,
             }],
         }
     }

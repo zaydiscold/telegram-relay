@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::config::{ChatId, Filter, WebhookName};
+use crate::config::{ChatId, Filter, MediaMode, WebhookName};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -11,6 +11,10 @@ pub struct ResolvedRoute {
     pub filter: Option<Filter>,
     /// Embed stripe color for posts relayed by this route.
     pub color: u32,
+    /// Optional per-route media mode; `None` falls back to the global
+    /// `media.mode` (resolved at use against the live [`crate::config::MediaCfg`]
+    /// snapshot). (queued-polish §11c)
+    pub media_mode: Option<MediaMode>,
 }
 
 pub struct Router(HashMap<ChatId, Vec<ResolvedRoute>>);
@@ -40,6 +44,7 @@ mod tests {
             to: vec![WebhookName("h".into())],
             filter: None,
             color: crate::render::DEFAULT_EMBED_COLOR,
+            media_mode: None,
         }]);
         assert_eq!(r.match_chat(ChatId(5)).len(), 1);
         assert!(r.match_chat(ChatId(6)).is_empty());
@@ -53,6 +58,7 @@ mod tests {
             to: vec![WebhookName(n.into())],
             filter: None,
             color: crate::render::DEFAULT_EMBED_COLOR,
+            media_mode: None,
         };
         let r = Router::new(vec![mk("a"), mk("b")]);
         assert_eq!(r.match_chat(ChatId(5)).len(), 2);

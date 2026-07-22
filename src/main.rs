@@ -21,7 +21,9 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use telegram_relay::cli::{clamp_backfill_count, Cli, Command, SESSION_FILE};
-use telegram_relay::config::{Config, MediaCfg, MediaMode, WebhookName, WebhookUrl};
+use telegram_relay::config::{
+    effective_media_mode, Config, MediaCfg, MediaMode, WebhookName, WebhookUrl,
+};
 use telegram_relay::dedup::Dedup;
 use telegram_relay::deliver::{Deliverer, PostResult};
 use telegram_relay::media::{sort_album_batch, AlbumBuffer, MediaItem, MediaTarget};
@@ -371,6 +373,8 @@ async fn backfill(
 
     let mut skipped_empty = 0usize;
 
+    // Effective media mode for this one route (route override or global).
+    let route_mode = effective_media_mode(route.media_mode, cfg.media.mode);
     // Fan-out targets for the coalesced-media path (backfill has one route).
     let media_targets: Vec<MediaTarget> = targets
         .iter()
@@ -379,9 +383,10 @@ async fn backfill(
             webhook: name.clone(),
             url: url.clone(),
             color: route.color,
+            mode: route_mode,
         })
         .collect();
-    let placeholder = cfg.media.mode == MediaMode::Placeholder;
+    let placeholder = route_mode == MediaMode::Placeholder;
 
     // Coalesce consecutive album siblings (same grouped_id) into one group; any
     // other message is its own group. `messages` is already oldest -> newest, so
@@ -482,6 +487,7 @@ async fn backfill(
                     fetched.comment_count.unwrap_or(0),
                     fetched.date.as_deref(),
                     &files,
+                    false, // backfill downloads only non-oversized files
                     &media_targets,
                 )
                 .await;
@@ -1002,7 +1008,8 @@ async fn handle_update(
             // Union of every matching route's webhooks (filter on caption),
             // deduped by webhook name so a media post reaches each distinct
             // target exactly once — even when several routes select the same
-            // webhook or an album fans out across routes.
+            // webhook or an album fans out across routes. Each target carries its
+            // route's EFFECTIVE media mode (route override or global default).
             let mut targets: Vec<MediaTarget> = Vec::new();
             let mut seen: HashSet<String> = HashSet::new();
             for route in routes {
@@ -1011,6 +1018,7 @@ async fn handle_update(
                         continue;
                     }
                 }
+                let mode = effective_media_mode(route.media_mode, snapshot.media.mode);
                 for (name, url) in resolve_targets_named(route, &snapshot.webhooks) {
                     if seen.insert(name.0.clone()) {
                         targets.push(MediaTarget {
@@ -1018,6 +1026,7 @@ async fn handle_update(
                             webhook: name,
                             url,
                             color: route.color,
+                            mode,
                         });
                     }
                 }
@@ -1026,95 +1035,63 @@ async fn handle_update(
                 return;
             }
             let title = title.unwrap_or_else(|| targets[0].route.clone());
-
-            // Oversized or placeholder mode: relay a rich embed carrying the
-            // caption + a notice + the deep link (no file), recorded like any
-            // other post so it dedups across restarts and the refresh worker
-            // keeps its stats live.
             let oversized = approx_size > snapshot.media.max_bytes;
-            if oversized || snapshot.media.mode == MediaMode::Placeholder {
-                let notice = if oversized {
-                    "[media too large to relay]"
-                } else {
-                    "[media]"
-                };
-                let body = if caption.trim().is_empty() {
-                    notice.to_string()
-                } else {
-                    format!("{caption}\n{notice}")
-                };
-                let hash = content_hash(&caption);
-                let text = RelayText {
-                    sender: None,
-                    body,
-                    reply_quote: None,
-                    edited: false,
-                };
-                for t in targets {
-                    // Built per target: the stripe color is the *route's*, and
-                    // the refresh worker re-derives it from the recorded row's
-                    // route, so posting one shared embed would let a multi-route
-                    // fan-out flip color on its first PATCH.
-                    let meta = EmbedMeta {
-                        title: title.clone(),
-                        avatar_url: None,
-                        deep_link: deep_link.clone(),
-                        reactions: Default::default(),
-                        comment_count: 0,
-                        deleted: false,
-                        color: t.color,
-                        timestamp: Some(date.clone()),
-                    };
-                    let embeds = render::embed(&text, &meta);
-                    let username = display_name(sender.as_deref(), &t.route);
-                    spawn_embed(
-                        deliverer.clone(),
-                        ops.clone(),
-                        store.clone(),
-                        t.url,
-                        NewRecord {
-                            chat_id: chat.0,
-                            tg_msg_id: msg_id,
-                            route: t.route,
-                            webhook_name: t.webhook.0,
-                            discord_msg_id: String::new(),
-                            content_hash: hash.clone(),
-                            reactions: Default::default(),
-                            comment_count: 0,
-                            latency_ms: None, // measured on delivery
-                        },
-                        username,
-                        embeds,
-                        date.clone(),
-                    );
-                }
-                return;
-            }
+            let any_reupload = targets.iter().any(|t| t.mode == MediaMode::Reupload);
 
-            // Downloadable: move the download OFF the hot path. One MediaItem
-            // per message, carrying the full target list + embed metadata; the
-            // album buffer coalesces siblings and flush_album posts ONE rich
-            // embed with all files per distinct target.
-            let client = client.clone();
-            let media_tx = media_tx.clone();
-            let ops = ops.clone();
-            tokio::spawn(async move {
-                let bytes = match download_media(&client, &media).await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        warn!(error = %e, msg_id, "media download failed");
-                        ops.drop_notice(&format!("media download failed (msg {msg_id}): {e}"))
+            // Download the bytes only when some target wants a re-upload AND the
+            // file is not oversized. Otherwise (oversized, or every target is
+            // placeholder) a FILE-LESS item still flows through the SAME album
+            // buffer, so a mixed album coalesces as ONE Discord message with the
+            // caption anchored to the right sibling (queued-polish §10a); the
+            // per-target notice is rendered at delivery (queued-polish §11c).
+            if any_reupload && !oversized {
+                // Downloadable: move the download OFF the hot path. The album
+                // buffer coalesces siblings and flush_album posts ONE rich embed
+                // (files for re-upload targets, notice for placeholder targets).
+                let client = client.clone();
+                let media_tx = media_tx.clone();
+                let ops = ops.clone();
+                tokio::spawn(async move {
+                    let bytes = match download_media(&client, &media).await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!(error = %e, msg_id, "media download failed");
+                            ops.drop_notice(&format!("media download failed (msg {msg_id}): {e}"))
+                                .await;
+                            return;
+                        }
+                    };
+                    let filename = media_filename(&media, msg_id);
+                    let item = MediaItem {
+                        grouped_id,
+                        msg_id,
+                        chat,
+                        file: Some((filename, bytes)),
+                        oversized: false,
+                        caption,
+                        deep_link,
+                        title,
+                        sender,
+                        date,
+                        targets,
+                    };
+                    // Never block the download task on a full channel: on
+                    // full/closed, log and post a rate-limited ops drop notice.
+                    if let Err(e) = media_tx.try_send(item) {
+                        warn!(error = %e, msg_id, "media channel send failed; dropping item");
+                        ops.drop_notice(&format!("media dropped (msg {msg_id}): channel {e}"))
                             .await;
-                        return;
                     }
-                };
-                let filename = media_filename(&media, msg_id);
+                });
+            } else {
+                // No download (oversized or all-placeholder): a file-less item
+                // still enters the buffer so the group stays intact.
                 let item = MediaItem {
                     grouped_id,
                     msg_id,
                     chat,
-                    filename,
-                    bytes,
+                    file: None,
+                    oversized,
                     caption,
                     deep_link,
                     title,
@@ -1122,14 +1099,12 @@ async fn handle_update(
                     date,
                     targets,
                 };
-                // Never block the download task on a full channel: on
-                // full/closed, log and post a rate-limited ops drop notice.
                 if let Err(e) = media_tx.try_send(item) {
                     warn!(error = %e, msg_id, "media channel send failed; dropping item");
                     ops.drop_notice(&format!("media dropped (msg {msg_id}): channel {e}"))
                         .await;
                 }
-            });
+            }
         }
     }
 }
@@ -1223,9 +1198,30 @@ async fn flush_album(deliverer: &Deliverer, ops: &Ops, store: &Store, batch: Vec
         0,
         Some(album.date.as_str()),
         &album.files,
+        album.any_oversized,
         &album.targets,
     )
     .await;
+}
+
+/// The notice body shown to a target that receives no attached file — a
+/// placeholder-mode route, or a reupload route whose media was too large.
+fn media_notice_text(mode: MediaMode, any_oversized: bool) -> &'static str {
+    match mode {
+        MediaMode::Placeholder => "[media]",
+        MediaMode::Reupload if any_oversized => "[media too large to relay]",
+        MediaMode::Reupload => "[media]",
+    }
+}
+
+/// Join a caption with a media notice, dropping the separator (and leading blank
+/// line) when the caption is empty.
+fn media_notice_body(caption: &str, notice: &str) -> String {
+    if caption.trim().is_empty() {
+        notice.to_string()
+    } else {
+        format!("{caption}\n{notice}")
+    }
 }
 
 /// The pure result of coalescing an album batch: the deduped files, the anchor
@@ -1240,6 +1236,9 @@ struct CoalescedAlbum {
     /// The anchor message's ORIGINAL Telegram publish time, RFC3339.
     date: String,
     files: Vec<(String, Vec<u8>)>,
+    /// Any sibling exceeded max_bytes (so a reupload target with no deliverable
+    /// files shows "[media too large to relay]" rather than a generic notice).
+    any_oversized: bool,
     targets: Vec<MediaTarget>,
 }
 
@@ -1258,13 +1257,18 @@ fn coalesce_album(mut batch: Vec<MediaItem>) -> Option<CoalescedAlbum> {
     }
 
     // De-duplicate files by msg_id (each physical photo once), preserving order.
+    // Items with no file (oversized / placeholder-only) contribute no bytes but
+    // still anchor the caption + fan-out targets below.
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     let mut seen_ids: HashSet<i32> = HashSet::new();
     for it in &batch {
-        if seen_ids.insert(it.msg_id) {
-            files.push((it.filename.clone(), it.bytes.clone()));
+        if let Some((filename, bytes)) = &it.file {
+            if seen_ids.insert(it.msg_id) {
+                files.push((filename.clone(), bytes.clone()));
+            }
         }
     }
+    let any_oversized = batch.iter().any(|it| it.oversized);
 
     // Anchor = the caption-bearing message (its msg_id keys the store row +
     // content hash); fall back to the lowest msg_id for a captionless album.
@@ -1308,6 +1312,7 @@ fn coalesce_album(mut batch: Vec<MediaItem>) -> Option<CoalescedAlbum> {
         sender: batch[0].sender.clone(),
         date,
         files,
+        any_oversized,
         targets,
     })
 }
@@ -1334,14 +1339,9 @@ async fn deliver_coalesced_media(
     comment_count: i32,
     timestamp: Option<&str>,
     files: &[(String, Vec<u8>)],
+    any_oversized: bool,
     targets: &[MediaTarget],
 ) -> (usize, usize, usize) {
-    let text = RelayText {
-        sender: None,
-        body: caption.to_string(),
-        reply_quote: None,
-        edited: false,
-    };
     // Hash the RAW caption: the refresh worker recomputes the hash from the
     // anchor message's text alone, so this matches and avoids a spurious edit.
     let hash = content_hash(caption);
@@ -1365,6 +1365,23 @@ async fn deliver_coalesced_media(
             }
         }
 
+        // Per-target media mode (queued-polish §11c): a reupload target with
+        // deliverable files gets the attached album; a placeholder target — or a
+        // reupload target whose media was oversized — gets a caption + notice
+        // embed with the deep link and no file (queued-polish §10a keeps the
+        // whole album one message either way).
+        let deliver_files = t.mode == MediaMode::Reupload && !files.is_empty();
+        let body = if deliver_files {
+            caption.to_string()
+        } else {
+            media_notice_body(caption, media_notice_text(t.mode, any_oversized))
+        };
+        let text = RelayText {
+            sender: None,
+            body,
+            reply_quote: None,
+            edited: false,
+        };
         // Built per target: the stripe color is the *route's*, and the refresh
         // worker re-derives it from the recorded row's route, so one shared
         // embed would let a multi-route fan-out flip color on its first PATCH.
@@ -1381,10 +1398,14 @@ async fn deliver_coalesced_media(
         let embeds = render::embed(&text, &meta);
 
         let username = display_name(sender, &t.route);
-        match deliverer
-            .post_media_embed(&t.url, &username, &embeds, files.to_vec())
-            .await
-        {
+        let result = if deliver_files {
+            deliverer
+                .post_media_embed(&t.url, &username, &embeds, files.to_vec())
+                .await
+        } else {
+            deliverer.post_embed(&t.url, &username, &embeds).await
+        };
+        match result {
             PostResult::Delivered { discord_msg_id } => {
                 // Latency is only meaningful for LIVE relays (ops present); the
                 // backfill path passes `ops: None` and records NULL latency.
@@ -1671,8 +1692,11 @@ mod album_coalesce_tests {
             grouped_id: Some(42),
             msg_id,
             chat: ChatId(-100),
-            filename: format!("photo_{msg_id}.jpg"),
-            bytes: format!("bytes-{msg_id}").into_bytes(),
+            file: Some((
+                format!("photo_{msg_id}.jpg"),
+                format!("bytes-{msg_id}").into_bytes(),
+            )),
+            oversized: false,
             caption: caption.to_string(),
             deep_link: Some(format!("https://t.me/c/{msg_id}")),
             title: "Rob's Channel".into(),
@@ -1685,6 +1709,7 @@ mod album_coalesce_tests {
                     webhook: WebhookName(h.to_string()),
                     url: WebhookUrl(format!("https://discord.example/{h}")),
                     color: render::DEFAULT_EMBED_COLOR,
+                    mode: MediaMode::Reupload,
                 })
                 .collect(),
         }

@@ -39,6 +39,26 @@ pub struct RouteCfg {
     /// Embed stripe color as a 24-bit RGB integer, already parsed from the
     /// optional `color: "#RRGGBB"` key (defaults to [`DEFAULT_EMBED_COLOR`]).
     pub color: u32,
+    /// Optional per-route media mode; falls back to the global `media.mode` when
+    /// unset (see [`effective_media_mode`]). Lets a cautious route relay t.me
+    /// links (zero download) while others re-upload. (queued-polish §11c)
+    pub media_mode: Option<MediaMode>,
+}
+
+/// Parse a media mode string (`reupload` | `placeholder`). Strict: an unknown
+/// value is rejected at config load rather than silently defaulting.
+pub fn parse_media_mode(s: &str) -> Option<MediaMode> {
+    match s {
+        "reupload" => Some(MediaMode::Reupload),
+        "placeholder" => Some(MediaMode::Placeholder),
+        _ => None,
+    }
+}
+
+/// Resolve a route's effective media mode: the route's own `mode` when set,
+/// otherwise the global `media.mode`. (queued-polish §11c)
+pub fn effective_media_mode(route: Option<MediaMode>, global: MediaMode) -> MediaMode {
+    route.unwrap_or(global)
 }
 
 /// Parse a `#RRGGBB` (or bare `RRGGBB`) hex color into a 24-bit RGB integer.
@@ -142,6 +162,8 @@ pub enum ConfigError {
     InvalidFrom { route: String, got: String },
     #[error("route '{route}': invalid color '{got}'; expected a quoted \"#RRGGBB\" hex string")]
     InvalidColor { route: String, got: String },
+    #[error("route '{route}': invalid media mode '{got}'; expected 'reupload' or 'placeholder'")]
+    InvalidMode { route: String, got: String },
 }
 
 // ---- raw (serde) layer: never leaves this module ----
@@ -199,6 +221,8 @@ mod raw {
         pub filter: Option<Filter>,
         #[serde(default)]
         pub color: Option<String>, // "#RRGGBB"
+        #[serde(default)]
+        pub mode: Option<String>, // "reupload" | "placeholder"
     }
     #[derive(Deserialize, Default)]
     pub struct Filter {
@@ -289,6 +313,15 @@ impl Config {
                     got: raw.clone(),
                 })?,
             };
+            let media_mode = match &r.mode {
+                None => None,
+                Some(raw) => Some(parse_media_mode(raw).ok_or_else(|| {
+                    ConfigError::InvalidMode {
+                        route: r.name.clone(),
+                        got: raw.clone(),
+                    }
+                })?),
+            };
             routes.push(RouteCfg {
                 name: r.name,
                 from,
@@ -298,6 +331,7 @@ impl Config {
                     exclude_hashtags: f.exclude_hashtags,
                 }),
                 color,
+                media_mode,
             });
         }
 
@@ -518,6 +552,51 @@ mod tests {
             e.contains("not-a-color"),
             "error should echo the bad value: {e}"
         );
+    }
+
+    #[test]
+    fn effective_media_mode_route_overrides_global() {
+        // Unset -> global; set -> the route's own mode wins.
+        assert_eq!(
+            effective_media_mode(None, MediaMode::Reupload),
+            MediaMode::Reupload
+        );
+        assert_eq!(
+            effective_media_mode(None, MediaMode::Placeholder),
+            MediaMode::Placeholder
+        );
+        assert_eq!(
+            effective_media_mode(Some(MediaMode::Placeholder), MediaMode::Reupload),
+            MediaMode::Placeholder
+        );
+        assert_eq!(
+            effective_media_mode(Some(MediaMode::Reupload), MediaMode::Placeholder),
+            MediaMode::Reupload
+        );
+    }
+
+    #[test]
+    fn route_media_mode_defaults_none_and_parses_override() {
+        std::env::set_var("TEST_HOOK_MODE", "https://discord.com/api/webhooks/1/x");
+        let p = write_tmp(
+            "route_mode",
+            "routes:\n  - name: cautious\n    from: \"@c\"\n    to: [h1]\n    mode: placeholder\n  - name: normal\n    from: \"@d\"\n    to: [h1]\nwebhooks:\n  h1: { env: TEST_HOOK_MODE }\nmedia: { mode: reupload, max_bytes: 1000 }\n",
+        );
+        let c = Config::load(&p).unwrap();
+        assert_eq!(c.routes[0].media_mode, Some(MediaMode::Placeholder));
+        assert_eq!(c.routes[1].media_mode, None); // unset -> falls back to global
+    }
+
+    #[test]
+    fn route_invalid_media_mode_rejected_naming_the_route() {
+        std::env::set_var("TEST_HOOK_MODE_BAD", "https://discord.com/api/webhooks/1/x");
+        let p = write_tmp(
+            "route_mode_bad",
+            "routes:\n  - name: typo-route\n    from: \"@c\"\n    to: [h1]\n    mode: reuplaod\nwebhooks:\n  h1: { env: TEST_HOOK_MODE_BAD }\nmedia: { mode: reupload, max_bytes: 1000 }\n",
+        );
+        let e = Config::load(&p).unwrap_err().to_string();
+        assert!(e.contains("typo-route"), "error should name the route: {e}");
+        assert!(e.contains("reuplaod"), "error should echo the bad value: {e}");
     }
 
     #[test]
