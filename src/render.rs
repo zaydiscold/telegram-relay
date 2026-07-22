@@ -57,26 +57,22 @@ pub fn is_image_filename(name: &str) -> bool {
         .any(|ext| lower.ends_with(ext))
 }
 
-/// Reference attached image files from INSIDE the embed(s), so Discord renders
-/// them within the embed frame (with the stripe, stats, and footer) instead of
-/// as bare attachments dangling below it.
+/// Reference images from INSIDE the embed(s) by URL, so Discord renders them
+/// within the embed frame (with the stripe, stats, and footer) instead of as
+/// bare attachments dangling below it.
 ///
-/// - **One image:** set `image.url = attachment://<file>` on the primary embed,
-///   so it sits under the caption in the same framed embed.
-/// - **An album (multiple images):** Discord merges embeds that share the same
-///   top-level `url` into a single gallery, so each image gets its own embed
-///   with a shared `gallery_url` and an `attachment://` reference. Capped at
-///   [`MAX_EMBEDS`].
+/// `image_urls` are used verbatim as each embed's `image.url`. On the initial
+/// post they are `attachment://<file>` references (matching the multipart parts);
+/// on a refresh PATCH they are the Discord CDN URLs captured from that first
+/// post — so the image survives a PATCH (which sends no attachments) instead of
+/// being stripped.
 ///
-/// `image_filenames` MUST byte-match the `file_name` of the attached multipart
-/// part, or Discord silently shows nothing. Non-image files are not referenced
-/// here (they attach below as a player/download — all Discord can do).
-pub fn attach_image_attachments(
-    embeds: &mut Value,
-    image_filenames: &[&str],
-    gallery_url: Option<&str>,
-) {
-    if image_filenames.is_empty() {
+/// - **One image:** set it on the primary (last description) embed.
+/// - **Album:** Discord merges embeds sharing the same top-level `url` into a
+///   gallery, so each extra image gets its own embed with a shared `gallery_url`.
+///   Capped at [`MAX_EMBEDS`].
+pub fn attach_image_urls(embeds: &mut Value, image_urls: &[&str], gallery_url: Option<&str>) {
+    if image_urls.is_empty() {
         return;
     }
     let Some(arr) = embeds.as_array_mut() else {
@@ -85,9 +81,9 @@ pub fn attach_image_attachments(
     // First image goes on the existing primary (last description) embed so it
     // renders under the text.
     if let Some(primary) = arr.last_mut() {
-        primary["image"] = json!({ "url": format!("attachment://{}", image_filenames[0]) });
+        primary["image"] = json!({ "url": image_urls[0] });
     }
-    if image_filenames.len() == 1 {
+    if image_urls.len() == 1 {
         return;
     }
     // Album: group into one gallery by giving every embed the same `url`.
@@ -96,15 +92,23 @@ pub fn attach_image_attachments(
     if let Some(primary) = arr.last_mut() {
         primary["url"] = json!(url);
     }
-    for name in image_filenames.iter().skip(1) {
+    for img in image_urls.iter().skip(1) {
         if arr.len() >= MAX_EMBEDS {
             break;
         }
         arr.push(json!({
             "url": url,
-            "image": { "url": format!("attachment://{name}") },
+            "image": { "url": img },
         }));
     }
+}
+
+/// Build `attachment://<filename>` references for the initial multipart post.
+pub fn attachment_refs(image_filenames: &[&str]) -> Vec<String> {
+    image_filenames
+        .iter()
+        .map(|n| format!("attachment://{n}"))
+        .collect()
 }
 
 /// "Let's get this bag" footer variations. One is chosen at random per post.
@@ -418,7 +422,9 @@ mod tests {
     #[test]
     fn single_image_referenced_inside_embed() {
         let mut embeds = json!([{ "description": "gm" }]);
-        attach_image_attachments(&mut embeds, &["photo_1.jpg"], Some("https://t.me/x/1"));
+        let refs = attachment_refs(&["photo_1.jpg"]);
+        let refs: Vec<&str> = refs.iter().map(String::as_str).collect();
+        attach_image_urls(&mut embeds, &refs, Some("https://t.me/x/1"));
         let e = &embeds.as_array().unwrap()[0];
         // image.url must EXACTLY match the attached filename, or Discord shows nothing.
         assert_eq!(e["image"]["url"], "attachment://photo_1.jpg");
@@ -428,10 +434,26 @@ mod tests {
     }
 
     #[test]
+    fn refresh_reattaches_by_cdn_url() {
+        // On a PATCH we pass the stored Discord CDN urls verbatim (no attachment://).
+        let mut embeds = json!([{ "description": "gm" }]);
+        attach_image_urls(
+            &mut embeds,
+            &["https://cdn.discordapp.com/attachments/1/2/photo.jpg"],
+            None,
+        );
+        assert_eq!(
+            embeds.as_array().unwrap()[0]["image"]["url"],
+            "https://cdn.discordapp.com/attachments/1/2/photo.jpg"
+        );
+    }
+
+    #[test]
     fn album_images_form_a_shared_url_gallery() {
         let mut embeds = json!([{ "description": "album" }]);
-        let names = ["a.jpg", "b.png", "c.webp"];
-        attach_image_attachments(&mut embeds, &names, Some("https://t.me/x/1"));
+        let refs = attachment_refs(&["a.jpg", "b.png", "c.webp"]);
+        let refs: Vec<&str> = refs.iter().map(String::as_str).collect();
+        attach_image_urls(&mut embeds, &refs, Some("https://t.me/x/1"));
         let arr = embeds.as_array().unwrap();
         assert_eq!(arr.len(), 3, "one primary + two image-only embeds");
         // Every embed shares the gallery url so Discord merges them.
@@ -479,7 +501,7 @@ mod tests {
     #[test]
     fn no_images_leaves_embeds_untouched() {
         let mut embeds = json!([{ "description": "just text" }]);
-        attach_image_attachments(&mut embeds, &[], None);
+        attach_image_urls(&mut embeds, &[], None);
         assert!(embeds.as_array().unwrap()[0].get("image").is_none());
     }
 

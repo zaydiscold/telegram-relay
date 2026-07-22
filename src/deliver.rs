@@ -16,11 +16,18 @@ pub enum Outcome {
 }
 
 /// Result of posting an embed, carrying the created Discord message id so the
-/// refresh worker can later PATCH it.
+/// refresh worker can later PATCH it, plus the Discord CDN URLs of any attached
+/// images (so a later PATCH can re-reference them — a PATCH sends no attachments,
+/// so an `attachment://` reference would otherwise be dropped).
 #[derive(Debug)]
 pub enum PostResult {
-    Delivered { discord_msg_id: String },
-    Dropped { reason: String },
+    Delivered {
+        discord_msg_id: String,
+        image_urls: Vec<String>,
+    },
+    Dropped {
+        reason: String,
+    },
 }
 
 impl Default for Deliverer {
@@ -77,7 +84,10 @@ impl Deliverer {
         let target = format!("{}?wait=true", url.0);
         match self.send_json_capture(&target, &body).await {
             Ok(text) => match parse_message_id(&text) {
-                Some(id) => PostResult::Delivered { discord_msg_id: id },
+                Some(id) => PostResult::Delivered {
+                    discord_msg_id: id,
+                    image_urls: Vec::new(),
+                },
                 None => PostResult::Dropped {
                     reason: format!("no message id in response: {text}"),
                 },
@@ -324,7 +334,10 @@ impl Deliverer {
             Ok(r) if r.status().is_success() => {
                 let text = r.text().await.unwrap_or_default();
                 match parse_message_id(&text) {
-                    Some(id) => PostResult::Delivered { discord_msg_id: id },
+                    Some(id) => PostResult::Delivered {
+                        discord_msg_id: id,
+                        image_urls: parse_attachment_urls(&text),
+                    },
                     None => PostResult::Dropped {
                         reason: format!("no message id in media response: {text}"),
                     },
@@ -351,6 +364,28 @@ fn parse_message_id(text: &str) -> Option<String> {
         .get("id")?
         .as_str()
         .map(|s| s.to_string())
+}
+
+/// Parse the CDN `url` of every image attachment from a Discord message
+/// response, in order. These are Discord's own hosted copies — reusing them on a
+/// later PATCH keeps the image inline without re-uploading (or re-downloading
+/// from Telegram). Non-image attachments (video/docs) are skipped since only
+/// images can render inside an embed.
+fn parse_attachment_urls(text: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    let Some(atts) = v.get("attachments").and_then(|a| a.as_array()) else {
+        return Vec::new();
+    };
+    atts.iter()
+        .filter(|a| {
+            a.get("filename")
+                .and_then(|f| f.as_str())
+                .is_some_and(crate::render::is_image_filename)
+        })
+        .filter_map(|a| a.get("url").and_then(|u| u.as_str()).map(String::from))
+        .collect()
 }
 
 fn retry_after_secs(r: &reqwest::Response) -> Option<f64> {

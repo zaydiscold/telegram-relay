@@ -34,6 +34,10 @@ pub struct NewRecord {
     /// Telegram publish time). `Some` only for LIVE relays; backfilled rows carry
     /// `None` because their latency is meaningless. (queued-polish §3)
     pub latency_ms: Option<i64>,
+    /// Discord CDN URLs of attached images, in order. Empty for text posts.
+    /// Reused on refresh PATCHes so the image stays inline (a PATCH sends no
+    /// attachments, so an `attachment://` reference would be dropped).
+    pub image_urls: Vec<String>,
 }
 
 /// Aggregate latency figures over the recorded LIVE relays.
@@ -111,6 +115,9 @@ pub struct TrackedMsg {
     /// a later stats-only PATCH keeps the edited (orange) stripe instead of
     /// reverting it to the regular color.
     pub edited: bool,
+    /// Discord CDN urls of this post's inline images, reused on PATCH so the
+    /// image survives a refresh (which sends no attachments). Empty for text.
+    pub image_urls: Vec<String>,
 }
 
 /// Serialize a reactions map to the JSON stored in the `reactions` column.
@@ -192,6 +199,7 @@ impl Store {
               deleted INTEGER NOT NULL DEFAULT 0,
               edited INTEGER NOT NULL DEFAULT 0,
               latency_ms INTEGER,
+              image_urls TEXT NOT NULL DEFAULT '[]',
               PRIMARY KEY (chat_id, tg_msg_id, discord_msg_id));
 
             -- Tracks the last identity (title + photo) pushed to each Discord
@@ -214,6 +222,12 @@ impl Store {
         Self::add_column_if_missing(
             &conn,
             "ALTER TABLE relayed ADD COLUMN edited INTEGER NOT NULL DEFAULT 0",
+        )?;
+        // Discord CDN urls of attached images, kept so refresh PATCHes preserve
+        // the inline image instead of stripping it.
+        Self::add_column_if_missing(
+            &conn,
+            "ALTER TABLE relayed ADD COLUMN image_urls TEXT NOT NULL DEFAULT '[]'",
         )?;
         Self::enable_incremental_auto_vacuum(&conn)?;
         Ok(Store {
@@ -264,8 +278,8 @@ impl Store {
             INSERT INTO relayed
               (chat_id, tg_msg_id, route, webhook_name, discord_msg_id,
                posted_at, last_checked, content_hash, reactions, comment_count,
-               deleted, latency_ms)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, 0, ?10)
+               deleted, latency_ms, image_urls)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, 0, ?10, ?11)
             ON CONFLICT(chat_id, tg_msg_id, discord_msg_id) DO UPDATE SET
               content_hash = excluded.content_hash,
               reactions = excluded.reactions,
@@ -283,6 +297,7 @@ impl Store {
                 reactions_to_json(&rec.reactions),
                 rec.comment_count,
                 rec.latency_ms,
+                serde_json::to_string(&rec.image_urls).unwrap_or_else(|_| "[]".to_string()),
             ],
         )
         .context("inserting relayed row")?;
@@ -324,7 +339,7 @@ impl Store {
             r#"
             SELECT chat_id, tg_msg_id, route, webhook_name, discord_msg_id,
                    content_hash, reactions, comment_count, posted_at, last_checked,
-                   edited
+                   edited, image_urls
             FROM relayed
             WHERE deleted = 0 AND posted_at >= ?1
             ORDER BY chat_id, tg_msg_id
@@ -343,6 +358,7 @@ impl Store {
                 posted_at: r.get(8)?,
                 last_checked: r.get(9)?,
                 edited: r.get::<_, i64>(10)? != 0,
+                image_urls: serde_json::from_str(&r.get::<_, String>(11)?).unwrap_or_default(),
             })
         })?;
         let mut out = Vec::new();
@@ -547,6 +563,7 @@ mod tests {
             reactions: map(&[("❤️", 1)]),
             comment_count: 0,
             latency_ms: None,
+            image_urls: Vec::new(),
         }
     }
 

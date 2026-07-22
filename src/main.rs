@@ -679,7 +679,7 @@ async fn backfill(
             }
 
             match deliverer.post_embed(url, &username, &embeds).await {
-                PostResult::Delivered { discord_msg_id } => {
+                PostResult::Delivered { discord_msg_id, .. } => {
                     let record = NewRecord {
                         chat_id: resolved.chat.0,
                         tg_msg_id: anchor_msg_id,
@@ -689,7 +689,8 @@ async fn backfill(
                         content_hash: hash.clone(),
                         reactions: fetched.reactions.clone(),
                         comment_count: fetched.comment_count.unwrap_or(0),
-                        latency_ms: None, // backfill latency is meaningless
+                        latency_ms: None,       // backfill latency is meaningless
+                        image_urls: Vec::new(), // text post: no attachments
                     };
                     if let Err(e) = store.record(record) {
                         warn!(error = %e, "backfill: failed to record relayed message");
@@ -1102,7 +1103,8 @@ async fn handle_update(
                             content_hash: hash.clone(),
                             reactions: Default::default(),
                             comment_count: 0,
-                            latency_ms: None, // measured on delivery
+                            latency_ms: None,       // measured on delivery
+                            image_urls: Vec::new(), // text post: no attachments
                         },
                         username.clone(),
                         embeds.clone(),
@@ -1260,7 +1262,7 @@ fn spawn_embed(
         }
 
         match deliverer.post_embed(&url, &username, &embeds).await {
-            PostResult::Delivered { discord_msg_id } => {
+            PostResult::Delivered { discord_msg_id, .. } => {
                 // Live relay: measure true end-to-end latency from the two
                 // authoritative clocks (Discord snowflake vs Telegram date).
                 let latency = relay_latency_ms(&discord_msg_id, &telegram_date);
@@ -1550,7 +1552,9 @@ async fn deliver_coalesced_media(
                 .map(|(name, _)| name.as_str())
                 .filter(|name| render::is_image_filename(name))
                 .collect();
-            render::attach_image_attachments(&mut embeds, &image_names, deep_link);
+            let refs = render::attachment_refs(&image_names);
+            let refs: Vec<&str> = refs.iter().map(String::as_str).collect();
+            render::attach_image_urls(&mut embeds, &refs, deep_link);
         }
 
         let username = display_name(sender, &t.route);
@@ -1562,7 +1566,10 @@ async fn deliver_coalesced_media(
             deliverer.post_embed(&t.url, &username, &embeds).await
         };
         match result {
-            PostResult::Delivered { discord_msg_id } => {
+            PostResult::Delivered {
+                discord_msg_id,
+                image_urls,
+            } => {
                 // Latency is only meaningful for LIVE relays (ops present); the
                 // backfill path passes `ops: None` and records NULL latency.
                 let latency_ms = match (ops, timestamp) {
@@ -1588,6 +1595,7 @@ async fn deliver_coalesced_media(
                     reactions: reactions.clone(),
                     comment_count,
                     latency_ms,
+                    image_urls,
                 };
                 if let Err(e) = store.record(record) {
                     warn!(error = %e, "failed to record relayed media");

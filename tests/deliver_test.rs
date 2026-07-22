@@ -116,7 +116,7 @@ async fn post_embed_captures_message_id() {
     let embeds = serde_json::json!([{ "description": "hi" }]);
     let out = d.post_embed(&WebhookUrl(url), "Rob", &embeds).await;
     match out {
-        PostResult::Delivered { discord_msg_id } => {
+        PostResult::Delivered { discord_msg_id, .. } => {
             assert_eq!(discord_msg_id, "998877665544332211");
         }
         PostResult::Dropped { reason } => panic!("expected delivered, got drop: {reason}"),
@@ -173,7 +173,7 @@ async fn post_media_embed_uploads_files_with_embed_and_suppresses_mentions() {
         .post_media_embed(&WebhookUrl(url), "Rob", &embeds, files)
         .await;
     match out {
-        PostResult::Delivered { discord_msg_id } => assert_eq!(discord_msg_id, "424242"),
+        PostResult::Delivered { discord_msg_id, .. } => assert_eq!(discord_msg_id, "424242"),
         PostResult::Dropped { reason } => panic!("expected delivered, got drop: {reason}"),
     }
     let bodies = hits.0.lock().unwrap();

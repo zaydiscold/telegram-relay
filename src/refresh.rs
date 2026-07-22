@@ -483,7 +483,8 @@ async fn apply(
                 // drops the timestamp the same way it drops title and body.
                 timestamp: None,
             };
-            let embed = render::embed(&text, &meta);
+            let mut embed = render::embed(&text, &meta);
+            reattach_stored_images(&mut embed, row, None);
             patch(deliverer, url, &row.discord_msg_id, embed).await;
             store.mark_deleted(row.chat_id, row.tg_msg_id)?;
         }
@@ -516,7 +517,8 @@ async fn apply(
                 color,
                 timestamp: f.date.clone(),
             };
-            let embed = render::embed(&text, &meta);
+            let mut embed = render::embed(&text, &meta);
+            reattach_stored_images(&mut embed, row, f.deep_link.as_deref());
             patch(deliverer, url, &row.discord_msg_id, embed).await;
             store.update_stats(
                 row.chat_id,
@@ -529,6 +531,18 @@ async fn apply(
         }
     }
     Ok(())
+}
+
+/// Re-reference a tracked post's images (by their stored Discord CDN url) inside
+/// the embed being PATCHed. A PATCH sends no attachments, so without this the
+/// `attachment://` image from the original post would be stripped on every
+/// reaction/edit/delete update.
+fn reattach_stored_images(embed: &mut serde_json::Value, row: &TrackedMsg, gallery: Option<&str>) {
+    if row.image_urls.is_empty() {
+        return;
+    }
+    let urls: Vec<&str> = row.image_urls.iter().map(String::as_str).collect();
+    render::attach_image_urls(embed, &urls, gallery);
 }
 
 async fn patch(
@@ -563,6 +577,7 @@ mod tests {
             posted_at: 0,
             last_checked: 0,
             edited: false,
+            image_urls: Vec::new(),
         }
     }
 
