@@ -40,5 +40,9 @@ else
   PAYLOAD="{\"content\":\"${SAFE}\",\"allowed_mentions\":{\"parse\":[]}}"
 fi
 
-curl -sS --max-time 15 -H 'Content-Type: application/json' \
-  -d "$PAYLOAD" "$WEBHOOK" >/dev/null
+# Pass the webhook URL via a curl config on stdin (-K -), NOT as an argv
+# argument — otherwise the token is briefly visible in `ps aux` to any local
+# user, which would contradict the "token never leaks" rule the Rust code holds.
+printf 'url = "%s"\n' "$WEBHOOK" \
+  | curl -K - -sS --max-time 15 -H 'Content-Type: application/json' \
+      -d "$PAYLOAD" >/dev/null
