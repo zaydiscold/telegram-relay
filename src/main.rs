@@ -69,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Chats { config } => chats(&config).await,
         Command::Check { config } => check(&config).await,
         Command::Stats { config } => stats_cmd(&config),
+        Command::Routes { config } => routes_cmd(&config),
         Command::Backfill {
             config,
             route,
@@ -245,6 +246,115 @@ fn stats_cmd(config_path: &Path) -> anyhow::Result<()> {
         }
         None => println!("{:<W$}(no live relays recorded yet)", "latency"),
     }
+    Ok(())
+}
+
+#[cfg(test)]
+mod routes_diagram_tests {
+    use super::render_routes_ascii;
+    use telegram_relay::config::{ChatRef, RouteCfg, WebhookName};
+    use telegram_relay::render::DEFAULT_EMBED_COLOR;
+
+    fn route(from: ChatRef, to: &[&str]) -> RouteCfg {
+        RouteCfg {
+            name: "r".into(),
+            from,
+            to: to.iter().map(|w| WebhookName(w.to_string())).collect(),
+            filter: None,
+            color: DEFAULT_EMBED_COLOR,
+            media_mode: None,
+        }
+    }
+
+    #[test]
+    fn diagram_shows_fan_in_and_fan_out() {
+        let routes = vec![
+            route(ChatRef::Username("rob".into()), &["main", "alerts"]), // fan-out
+            route(ChatRef::Username("watcher".into()), &["main"]),       // fan-in w/ rob
+            route(ChatRef::Id(telegram_relay::config::ChatId(-100)), &["main"]),
+        ];
+        let out = render_routes_ascii(&routes, 2);
+        assert!(out.contains("3 route(s), 2 webhook(s)"));
+        assert!(out.contains("@rob")); // username rendered with @
+        assert!(out.contains("-100")); // numeric id as-is
+        assert!(out.contains("fan-in")); // main has 3 sources
+        assert!(out.contains("fan-out")); // rob has 2 webhooks
+        assert!(out.contains("◀──") && out.contains("──▶"));
+    }
+
+    #[test]
+    fn no_fan_sections_when_all_one_to_one() {
+        let routes = vec![route(ChatRef::Username("a".into()), &["x"])];
+        let out = render_routes_ascii(&routes, 1);
+        assert!(!out.contains("fan-in"));
+        assert!(!out.contains("fan-out"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// routes — ASCII wiring diagram (no network)
+// ---------------------------------------------------------------------------
+
+/// Render a `ChatRef` the way a user wrote it in config: `@name` or a raw id.
+fn source_label(from: &telegram_relay::config::ChatRef) -> String {
+    use telegram_relay::config::ChatRef;
+    match from {
+        ChatRef::Username(u) => format!("@{u}"),
+        ChatRef::Id(id) => id.0.to_string(),
+    }
+}
+
+/// Draw the routing table as an ASCII diagram: each source and the webhooks it
+/// feeds, plus explicit fan-in (many sources → one webhook) and fan-out (one
+/// source → many webhooks) sections so the "profile" shape is obvious. Pure so
+/// it can be unit-tested; `routes_cmd` just prints it.
+fn render_routes_ascii(routes: &[telegram_relay::config::RouteCfg], webhook_count: usize) -> String {
+    use std::collections::BTreeMap;
+    let mut out = String::new();
+    out.push_str(&format!(
+        "telegram-relay — routing ({} route(s), {webhook_count} webhook(s))\n\n",
+        routes.len(),
+    ));
+
+    // source → webhooks (in config order), and the inverse for fan-in.
+    let width = routes
+        .iter()
+        .map(|r| source_label(&r.from).chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut by_webhook: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for r in routes {
+        let src = source_label(&r.from);
+        let hooks: Vec<&str> = r.to.iter().map(|w| w.0.as_str()).collect();
+        out.push_str(&format!("  {src:<width$}  ──▶  {}\n", hooks.join(", ")));
+        for h in hooks {
+            by_webhook.entry(h).or_default().push(src.clone());
+        }
+    }
+
+    let fan_in: Vec<_> = by_webhook.iter().filter(|(_, s)| s.len() > 1).collect();
+    if !fan_in.is_empty() {
+        out.push_str("\nfan-in (many sources → one webhook):\n");
+        for (hook, srcs) in fan_in {
+            out.push_str(&format!("  {hook}  ◀──  {}\n", srcs.join(", ")));
+        }
+    }
+
+    let fan_out: Vec<_> = routes.iter().filter(|r| r.to.len() > 1).collect();
+    if !fan_out.is_empty() {
+        out.push_str("\nfan-out (one source → many webhooks):\n");
+        for r in fan_out {
+            let hooks: Vec<&str> = r.to.iter().map(|w| w.0.as_str()).collect();
+            out.push_str(&format!("  {}  ──▶  {}\n", source_label(&r.from), hooks.join(", ")));
+        }
+    }
+    out
+}
+
+/// `routes` verb: print the wiring diagram from config alone (no session).
+fn routes_cmd(config_path: &Path) -> anyhow::Result<()> {
+    let cfg = Config::load(config_path).context("loading config")?;
+    print!("{}", render_routes_ascii(&cfg.routes, cfg.webhooks.len()));
     Ok(())
 }
 

@@ -67,6 +67,12 @@ pub enum Command {
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
     },
+    /// Print an ASCII diagram of the routing wiring (source → webhooks) from
+    /// config alone — no Telegram session needed. Shows fan-in and fan-out.
+    Routes {
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+    },
     /// Relay the most recent N messages from one route's chat, on demand.
     ///
     /// Fetches via the same live pipeline (filter, embed, post, record) so the
