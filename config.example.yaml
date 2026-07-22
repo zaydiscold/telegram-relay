@@ -1,19 +1,28 @@
 routes:
-  - name: robs-thoughts
-    from: "@robthinks"          # @username or numeric chat id
-    to: [discord_robs]          # fan-out: list more webhook names
+  - name: main-channel
+    from: "@some_public_channel"  # @username or numeric chat id (see `chats`)
+    to: [main]                    # fan-out: list more webhook names for 1→N
     # Optional. Left-bar color for REGULAR posts from this route, as a quoted
     # "#RRGGBB" hex (YAML treats an unquoted # as a comment, so quotes matter).
     # Defaults to #9b7dff (purple) when omitted. Edited posts show orange and
     # deleted posts show red regardless of this — state color wins. A malformed
     # hex value fails startup, naming this route.
     # color: "#9b7dff"
+    # Optional. Overrides the global `media.mode` for just this route — e.g.
+    # relay a sensitive source as links only while others re-upload inline.
+    # mode: placeholder
     # filter:
     #   any_keywords: ["entry", "alert"]
     #   exclude_hashtags: ["#ad"]
+  # A second route can reuse the SAME webhook name for N→1 fan-in — several
+  # sources landing in one Discord channel:
+  # - name: second-channel
+  #   from: "@another_channel"
+  #   to: [main]
 
 webhooks:
-  discord_robs: { env: DISCORD_WEBHOOK_ROBS }
+  main: { env: DISCORD_WEBHOOK_MAIN }
+  # Add more names here and reference them from any route's `to:` list.
 
 ops_webhook: { env: DISCORD_WEBHOOK_OPS }   # optional: startup/error notices
 
