@@ -29,6 +29,65 @@ pub fn embed_timestamp(dt: chrono::DateTime<chrono::Utc>) -> String {
     dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+/// Image extensions Discord can render *inside* an embed via `attachment://`.
+/// Video and documents can't be embedded — Discord attaches them below.
+pub fn is_image_filename(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [".jpg", ".jpeg", ".png", ".gif", ".webp"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
+}
+
+/// Reference attached image files from INSIDE the embed(s), so Discord renders
+/// them within the embed frame (with the stripe, stats, and footer) instead of
+/// as bare attachments dangling below it.
+///
+/// - **One image:** set `image.url = attachment://<file>` on the primary embed,
+///   so it sits under the caption in the same framed embed.
+/// - **An album (multiple images):** Discord merges embeds that share the same
+///   top-level `url` into a single gallery, so each image gets its own embed
+///   with a shared `gallery_url` and an `attachment://` reference. Capped at
+///   [`MAX_EMBEDS`].
+///
+/// `image_filenames` MUST byte-match the `file_name` of the attached multipart
+/// part, or Discord silently shows nothing. Non-image files are not referenced
+/// here (they attach below as a player/download — all Discord can do).
+pub fn attach_image_attachments(
+    embeds: &mut Value,
+    image_filenames: &[&str],
+    gallery_url: Option<&str>,
+) {
+    if image_filenames.is_empty() {
+        return;
+    }
+    let Some(arr) = embeds.as_array_mut() else {
+        return;
+    };
+    // First image goes on the existing primary (last description) embed so it
+    // renders under the text.
+    if let Some(primary) = arr.last_mut() {
+        primary["image"] = json!({ "url": format!("attachment://{}", image_filenames[0]) });
+    }
+    if image_filenames.len() == 1 {
+        return;
+    }
+    // Album: group into one gallery by giving every embed the same `url`.
+    // Discord needs a valid http(s) url to group on; fall back to a stable one.
+    let url = gallery_url.unwrap_or("https://t.me");
+    if let Some(primary) = arr.last_mut() {
+        primary["url"] = json!(url);
+    }
+    for name in image_filenames.iter().skip(1) {
+        if arr.len() >= MAX_EMBEDS {
+            break;
+        }
+        arr.push(json!({
+            "url": url,
+            "image": { "url": format!("attachment://{name}") },
+        }));
+    }
+}
+
 /// "Let's get this bag" footer variations. One is chosen at random per post.
 ///
 /// Rendered uniformly as `by zayd — {variant}`. Loosely themed in four groups —
@@ -334,6 +393,51 @@ fn split_chunks(s: &str, limit: usize) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::config::Filter;
+
+    #[test]
+    fn image_filename_detection() {
+        for ok in ["a.jpg", "b.JPEG", "c.png", "d.gif", "e.WEBP"] {
+            assert!(is_image_filename(ok), "{ok} should be an image");
+        }
+        for no in ["clip.mp4", "doc.pdf", "v.mov", "noext", "song.mp3"] {
+            assert!(!is_image_filename(no), "{no} should NOT be an image");
+        }
+    }
+
+    #[test]
+    fn single_image_referenced_inside_embed() {
+        let mut embeds = json!([{ "description": "gm" }]);
+        attach_image_attachments(&mut embeds, &["photo_1.jpg"], Some("https://t.me/x/1"));
+        let e = &embeds.as_array().unwrap()[0];
+        // image.url must EXACTLY match the attached filename, or Discord shows nothing.
+        assert_eq!(e["image"]["url"], "attachment://photo_1.jpg");
+        // A single image needs no gallery url.
+        assert!(e.get("url").is_none());
+        assert_eq!(embeds.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn album_images_form_a_shared_url_gallery() {
+        let mut embeds = json!([{ "description": "album" }]);
+        let names = ["a.jpg", "b.png", "c.webp"];
+        attach_image_attachments(&mut embeds, &names, Some("https://t.me/x/1"));
+        let arr = embeds.as_array().unwrap();
+        assert_eq!(arr.len(), 3, "one primary + two image-only embeds");
+        // Every embed shares the gallery url so Discord merges them.
+        for e in arr {
+            assert_eq!(e["url"], "https://t.me/x/1");
+        }
+        assert_eq!(arr[0]["image"]["url"], "attachment://a.jpg");
+        assert_eq!(arr[1]["image"]["url"], "attachment://b.png");
+        assert_eq!(arr[2]["image"]["url"], "attachment://c.webp");
+    }
+
+    #[test]
+    fn no_images_leaves_embeds_untouched() {
+        let mut embeds = json!([{ "description": "just text" }]);
+        attach_image_attachments(&mut embeds, &[], None);
+        assert!(embeds.as_array().unwrap()[0].get("image").is_none());
+    }
 
     fn rt(body: &str) -> RelayText {
         RelayText {

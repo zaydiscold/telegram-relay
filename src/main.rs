@@ -1395,7 +1395,19 @@ async fn deliver_coalesced_media(
             color: t.color,
             timestamp: timestamp.map(|s| s.to_string()),
         };
-        let embeds = render::embed(&text, &meta);
+        let mut embeds = render::embed(&text, &meta);
+        // Render images INSIDE the embed frame (attachment://) rather than as
+        // bare attachments below it. Only images can be inlined; video/docs
+        // still attach below. Filenames must match the parts post_media_embed
+        // sends, so both derive from the same `files` list.
+        if deliver_files {
+            let image_names: Vec<&str> = files
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .filter(|name| render::is_image_filename(name))
+                .collect();
+            render::attach_image_attachments(&mut embeds, &image_names, deep_link);
+        }
 
         let username = display_name(sender, &t.route);
         let result = if deliver_files {
