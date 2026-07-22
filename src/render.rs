@@ -13,12 +13,33 @@ pub const EMBED_DESC_LIMIT: usize = 4096;
 /// Discord allows at most 10 embeds per message.
 pub const MAX_EMBEDS: usize = 10;
 
-/// Default embed stripe color: a vivid Telegram-ish neon blue (`#29B6F6`).
+/// Default embed stripe color: the zayd.wtf accent purple (`#9b7dff`).
 ///
-/// Used for every route that does not set `color: "#RRGGBB"` in config.yaml.
-/// Deliberately not the Discord-default gray — the left bar is the strongest
-/// at-a-glance signal that a post came from the Telegram relay.
-pub const DEFAULT_EMBED_COLOR: u32 = 0x29B6F6;
+/// Used for every regular (text or media) post whose route does not set
+/// `color: "#RRGGBB"`. Deliberately not the Discord-default gray — the left bar
+/// is the strongest at-a-glance signal, and it doubles as a state indicator
+/// (see [`EDITED_COLOR`] / [`DELETED_COLOR`]).
+pub const DEFAULT_EMBED_COLOR: u32 = 0x9b7dff;
+
+/// Stripe color for an edited post (`#ff8c42`, zayd.wtf orange). Orange means
+/// "this was edited" — it overrides the route color on the in-place PATCH.
+pub const EDITED_COLOR: u32 = 0xff8c42;
+
+/// Stripe color for a deleted post (`#e84a5f`, zayd.wtf red). Red + a "deleted"
+/// note; the body is NOT struck through (user preference).
+pub const DELETED_COLOR: u32 = 0xe84a5f;
+
+/// The stripe color for a post given its state. State wins over the route color:
+/// deleted (red) > edited (orange) > regular (route color / purple default).
+fn state_color(route_color: u32, edited: bool, deleted: bool) -> u32 {
+    if deleted {
+        DELETED_COLOR
+    } else if edited {
+        EDITED_COLOR
+    } else {
+        route_color
+    }
+}
 
 /// Format a Telegram publish time for Discord's embed `timestamp` field.
 ///
@@ -211,20 +232,6 @@ pub fn stats_line(reactions: &BTreeMap<String, i32>, comment_count: i32) -> Stri
     parts.join(" · ")
 }
 
-/// Wrap every non-empty line of `s` in markdown strikethrough.
-fn strike(s: &str) -> String {
-    s.lines()
-        .map(|l| {
-            if l.trim().is_empty() {
-                l.to_string()
-            } else {
-                format!("~~{l}~~")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 /// Split a string into `<= limit`-char chunks (char-safe, no word wrapping).
 fn split_desc(s: &str, limit: usize) -> Vec<String> {
     if s.chars().count() <= limit {
@@ -253,12 +260,13 @@ pub fn embed(post: &RelayText, meta: &EmbedMeta) -> Value {
     }
     body.push_str(&post.body);
 
+    // Deleted posts are marked with a note (and colored red below) but the body
+    // is NOT struck through — user preference: just say it's deleted.
     let mut description = if meta.deleted {
-        let struck = strike(&body);
-        if struck.is_empty() {
+        if body.trim().is_empty() {
             "🗑 deleted on Telegram".to_string()
         } else {
-            format!("{struck}\n🗑 deleted on Telegram")
+            format!("{body}\n🗑 deleted on Telegram")
         }
     } else {
         body
@@ -266,6 +274,11 @@ pub fn embed(post: &RelayText, meta: &EmbedMeta) -> Value {
     if description.is_empty() {
         description.push('\u{200b}'); // zero-width space: Discord rejects empty descriptions
     }
+
+    // State drives the stripe color, overriding the route color. On a refresh
+    // PATCH the same call re-runs with edited/deleted set, so the stripe
+    // transitions (purple -> orange on edit, purple -> red on delete).
+    let color = state_color(meta.color, post.edited, meta.deleted);
 
     let mut chunks = split_desc(&description, EMBED_DESC_LIMIT);
     if chunks.len() > MAX_EMBEDS {
@@ -275,7 +288,7 @@ pub fn embed(post: &RelayText, meta: &EmbedMeta) -> Value {
     let last = chunks.len() - 1;
     let mut embeds = Vec::with_capacity(chunks.len());
     for (i, chunk) in chunks.into_iter().enumerate() {
-        let mut e = json!({ "description": chunk, "color": meta.color });
+        let mut e = json!({ "description": chunk, "color": color });
 
         if i == 0 {
             let mut author = json!({ "name": meta.title });
@@ -433,6 +446,39 @@ mod tests {
     }
 
     #[test]
+    fn stripe_color_follows_state() {
+        let route = 0x123456;
+        // Regular text/media post keeps the route color.
+        assert_eq!(state_color(route, false, false), route);
+        // Edited -> orange; deleted -> red; deleted wins over edited.
+        assert_eq!(state_color(route, true, false), EDITED_COLOR);
+        assert_eq!(state_color(route, false, true), DELETED_COLOR);
+        assert_eq!(state_color(route, true, true), DELETED_COLOR);
+        assert_eq!(DEFAULT_EMBED_COLOR, 0x9b7dff);
+    }
+
+    #[test]
+    fn deleted_embed_is_red_with_note_and_no_strikethrough() {
+        let meta = EmbedMeta {
+            deleted: true,
+            color: DEFAULT_EMBED_COLOR,
+            ..EmbedMeta::default()
+        };
+        let post = RelayText {
+            sender: None,
+            body: "gm frens".into(),
+            reply_quote: None,
+            edited: false,
+        };
+        let v = embed(&post, &meta);
+        let e = &v.as_array().unwrap()[0];
+        assert_eq!(e["color"], DELETED_COLOR as i64);
+        let desc = e["description"].as_str().unwrap();
+        assert!(desc.contains("deleted"), "must say deleted");
+        assert!(!desc.contains("~~"), "body must NOT be struck through");
+    }
+
+    #[test]
     fn no_images_leaves_embeds_untouched() {
         let mut embeds = json!([{ "description": "just text" }]);
         attach_image_attachments(&mut embeds, &[], None);
@@ -575,7 +621,7 @@ mod tests {
         let e = &out[0];
         // Discord wants a decimal int, not a "#RRGGBB" string.
         assert_eq!(e["color"], json!(DEFAULT_EMBED_COLOR));
-        assert_eq!(e["color"].as_u64(), Some(2733814)); // 0x29B6F6
+        assert_eq!(e["color"].as_u64(), Some(10190335)); // 0x9b7dff
         assert_eq!(e["timestamp"], "2026-07-20T12:00:00Z");
     }
 
@@ -649,12 +695,15 @@ mod tests {
     }
 
     #[test]
-    fn embed_deleted_strikes_and_marks() {
+    fn embed_deleted_marks_red_without_strikethrough() {
         let mut m = meta();
         m.deleted = true;
         let out = embed(&rt("bye"), &m);
-        let desc = out[0]["description"].as_str().unwrap();
-        assert!(desc.contains("~~bye~~"));
+        let e = &out[0];
+        assert_eq!(e["color"].as_u64(), Some(DELETED_COLOR as u64));
+        let desc = e["description"].as_str().unwrap();
+        assert!(desc.contains("bye")); // body kept as-is
+        assert!(!desc.contains("~~")); // no strikethrough
         assert!(desc.contains("🗑 deleted on Telegram"));
     }
 

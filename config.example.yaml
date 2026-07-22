@@ -2,11 +2,12 @@ routes:
   - name: robs-thoughts
     from: "@robthinks"          # @username or numeric chat id
     to: [discord_robs]          # fan-out: list more webhook names
-    # Optional. Left-bar color of the Discord embed, as a quoted "#RRGGBB" hex
-    # string (YAML treats an unquoted # as a comment, so the quotes matter).
-    # Defaults to a neon Telegram blue (#29B6F6) when omitted. A malformed hex
-    # value fails startup, naming this route.
-    # color: "#29B6F6"
+    # Optional. Left-bar color for REGULAR posts from this route, as a quoted
+    # "#RRGGBB" hex (YAML treats an unquoted # as a comment, so quotes matter).
+    # Defaults to #9b7dff (purple) when omitted. Edited posts show orange and
+    # deleted posts show red regardless of this — state color wins. A malformed
+    # hex value fails startup, naming this route.
+    # color: "#9b7dff"
     # filter:
     #   any_keywords: ["entry", "alert"]
     #   exclude_hashtags: ["#ad"]
