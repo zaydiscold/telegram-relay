@@ -308,7 +308,10 @@ fn source_label(from: &telegram_relay::config::ChatRef) -> String {
 /// feeds, plus explicit fan-in (many sources → one webhook) and fan-out (one
 /// source → many webhooks) sections so the "profile" shape is obvious. Pure so
 /// it can be unit-tested; `routes_cmd` just prints it.
-fn render_routes_ascii(routes: &[telegram_relay::config::RouteCfg], webhook_count: usize) -> String {
+fn render_routes_ascii(
+    routes: &[telegram_relay::config::RouteCfg],
+    webhook_count: usize,
+) -> String {
     use std::collections::BTreeMap;
     let mut out = String::new();
     out.push_str(&format!(
@@ -345,7 +348,11 @@ fn render_routes_ascii(routes: &[telegram_relay::config::RouteCfg], webhook_coun
         out.push_str("\nfan-out (one source → many webhooks):\n");
         for r in fan_out {
             let hooks: Vec<&str> = r.to.iter().map(|w| w.0.as_str()).collect();
-            out.push_str(&format!("  {}  ──▶  {}\n", source_label(&r.from), hooks.join(", ")));
+            out.push_str(&format!(
+                "  {}  ──▶  {}\n",
+                source_label(&r.from),
+                hooks.join(", ")
+            ));
         }
     }
     out

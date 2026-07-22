@@ -493,11 +493,18 @@ async fn apply(
             // unknown (`None`), so a reaction-only refresh never zeroes a real
             // comment count (§10b).
             let comment_count = effective_comment_count(f.comment_count, row.comment_count);
+            // Once a post has been edited it STAYS edited (orange): a later
+            // stats-only refresh must not revert the stripe. So OR the freshly
+            // detected edit with the persisted flag.
+            let is_edited = row.edited || *action == RefreshAction::Edited;
+            if *action == RefreshAction::Edited && !row.edited {
+                store.mark_edited(row.chat_id, row.tg_msg_id)?;
+            }
             let text = RelayText {
                 sender: None,
                 body: f.body.clone(),
                 reply_quote: None,
-                edited: *action == RefreshAction::Edited,
+                edited: is_edited,
             };
             let meta = EmbedMeta {
                 title: f.title.clone(),
@@ -555,6 +562,7 @@ mod tests {
             comment_count: comments,
             posted_at: 0,
             last_checked: 0,
+            edited: false,
         }
     }
 

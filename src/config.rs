@@ -313,12 +313,14 @@ impl Config {
             };
             let media_mode = match &r.mode {
                 None => None,
-                Some(raw) => Some(parse_media_mode(raw).ok_or_else(|| {
-                    ConfigError::InvalidMode {
-                        route: r.name.clone(),
-                        got: raw.clone(),
-                    }
-                })?),
+                Some(raw) => {
+                    Some(
+                        parse_media_mode(raw).ok_or_else(|| ConfigError::InvalidMode {
+                            route: r.name.clone(),
+                            got: raw.clone(),
+                        })?,
+                    )
+                }
             };
             routes.push(RouteCfg {
                 name: r.name,
@@ -594,7 +596,10 @@ mod tests {
         );
         let e = Config::load(&p).unwrap_err().to_string();
         assert!(e.contains("typo-route"), "error should name the route: {e}");
-        assert!(e.contains("reuplaod"), "error should echo the bad value: {e}");
+        assert!(
+            e.contains("reuplaod"),
+            "error should echo the bad value: {e}"
+        );
     }
 
     #[test]

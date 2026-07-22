@@ -107,6 +107,10 @@ pub struct TrackedMsg {
     /// Unix seconds of the last refresh check on this row. Advances on every
     /// evaluated tick (even a no-change one) so the cadence gate progresses.
     pub last_checked: i64,
+    /// Whether the source message has ever been edited on Telegram. Persisted so
+    /// a later stats-only PATCH keeps the edited (orange) stripe instead of
+    /// reverting it to the regular color.
+    pub edited: bool,
 }
 
 /// Serialize a reactions map to the JSON stored in the `reactions` column.
@@ -186,6 +190,7 @@ impl Store {
               reactions TEXT NOT NULL DEFAULT '{}',
               comment_count INTEGER NOT NULL DEFAULT 0,
               deleted INTEGER NOT NULL DEFAULT 0,
+              edited INTEGER NOT NULL DEFAULT 0,
               latency_ms INTEGER,
               PRIMARY KEY (chat_id, tg_msg_id, discord_msg_id));
 
@@ -204,6 +209,12 @@ impl Store {
         // error) once the column is present — including on brand-new dbs where the
         // CREATE above already added it. (queued-polish §3)
         Self::add_column_if_missing(&conn, "ALTER TABLE relayed ADD COLUMN latency_ms INTEGER")?;
+        // `edited` persists the edited state so a later stats-only refresh PATCH
+        // doesn't revert an edited post's stripe from orange back to purple.
+        Self::add_column_if_missing(
+            &conn,
+            "ALTER TABLE relayed ADD COLUMN edited INTEGER NOT NULL DEFAULT 0",
+        )?;
         Self::enable_incremental_auto_vacuum(&conn)?;
         Ok(Store {
             conn: Mutex::new(conn),
@@ -312,7 +323,8 @@ impl Store {
         let mut stmt = conn.prepare(
             r#"
             SELECT chat_id, tg_msg_id, route, webhook_name, discord_msg_id,
-                   content_hash, reactions, comment_count, posted_at, last_checked
+                   content_hash, reactions, comment_count, posted_at, last_checked,
+                   edited
             FROM relayed
             WHERE deleted = 0 AND posted_at >= ?1
             ORDER BY chat_id, tg_msg_id
@@ -330,6 +342,7 @@ impl Store {
                 comment_count: r.get(7)?,
                 posted_at: r.get(8)?,
                 last_checked: r.get(9)?,
+                edited: r.get::<_, i64>(10)? != 0,
             })
         })?;
         let mut out = Vec::new();
@@ -385,6 +398,18 @@ impl Store {
             rusqlite::params![chat_id, tg_msg_id, discord_msg_id, now],
         )
         .context("touching last_checked")?;
+        Ok(())
+    }
+
+    /// Mark a Telegram post as edited (all its Discord messages), so later
+    /// stats-only refreshes keep the edited stripe instead of reverting it.
+    pub fn mark_edited(&self, chat_id: i64, tg_msg_id: i32) -> Result<()> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.execute(
+            "UPDATE relayed SET edited = 1 WHERE chat_id = ?1 AND tg_msg_id = ?2",
+            rusqlite::params![chat_id, tg_msg_id],
+        )
+        .context("marking edited")?;
         Ok(())
     }
 
@@ -584,6 +609,31 @@ mod tests {
         // still present in the table, but excluded from due()
         assert_eq!(store.count().unwrap(), 2);
         assert_eq!(store.due(48).unwrap().len(), 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mark_edited_persists_and_survives_stats_update() {
+        let path = tmp_db("edited");
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).unwrap();
+
+        store.record(rec(1, 1, "d-a")).unwrap();
+        assert!(!store.due(48).unwrap()[0].edited, "starts un-edited");
+
+        store.mark_edited(1, 1).unwrap();
+        assert!(store.due(48).unwrap()[0].edited, "edited flag persisted");
+
+        // A later stats-only update must NOT clear the edited flag (the bug:
+        // reaction refresh reverting an edited post's stripe to purple).
+        store
+            .update_stats(1, 1, "d-a", "newhash", &BTreeMap::new(), 0)
+            .unwrap();
+        assert!(
+            store.due(48).unwrap()[0].edited,
+            "edited must survive a stats-only refresh"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
