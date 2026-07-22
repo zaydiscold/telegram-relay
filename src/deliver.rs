@@ -317,10 +317,21 @@ impl Deliverer {
         files: Vec<(String, Vec<u8>)>,
     ) -> PostResult {
         let target = format!("{}?wait=true", url.0);
+        // Discord (v10) only registers uploaded files as attachments if
+        // payload_json DECLARES them in an `attachments` array whose `id` matches
+        // the `files[N]` part index. Without this, the files are silently ignored
+        // (`attachments: []` in the response) and any `attachment://` embed image
+        // shows nothing. Declaring them here is what makes the inline image work.
+        let attachment_meta: Vec<serde_json::Value> = files
+            .iter()
+            .enumerate()
+            .map(|(i, (filename, _))| serde_json::json!({ "id": i, "filename": filename }))
+            .collect();
         let payload = serde_json::json!({
             "username": username,
             "embeds": embeds,
             "allowed_mentions": { "parse": [] },
+            "attachments": attachment_meta,
         })
         .to_string();
         // multipart Form is not clonable, so it is built fresh here (single
@@ -336,7 +347,7 @@ impl Deliverer {
                 match parse_message_id(&text) {
                     Some(id) => PostResult::Delivered {
                         discord_msg_id: id,
-                        image_urls: parse_attachment_urls(&text),
+                        image_urls: parse_embed_image_urls(&text),
                     },
                     None => PostResult::Dropped {
                         reason: format!("no message id in media response: {text}"),
@@ -366,25 +377,24 @@ fn parse_message_id(text: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Parse the CDN `url` of every image attachment from a Discord message
-/// response, in order. These are Discord's own hosted copies — reusing them on a
-/// later PATCH keeps the image inline without re-uploading (or re-downloading
-/// from Telegram). Non-image attachments (video/docs) are skipped since only
-/// images can render inside an embed.
-fn parse_attachment_urls(text: &str) -> Vec<String> {
+/// Parse the resolved image CDN URLs from a Discord message response.
+///
+/// When an embed references an uploaded image via `attachment://`, Discord
+/// resolves it, moves the final `cdn.discordapp.com` URL into the embed's
+/// `image.url`, and empties the top-level `attachments` array. So the durable
+/// URL to reuse on a later PATCH lives at `embeds[].image.url`, not in
+/// `attachments`. These are Discord's own hosted copies — reusing them keeps the
+/// image inline on refresh without re-uploading (or re-downloading from Telegram).
+fn parse_embed_image_urls(text: &str) -> Vec<String> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
         return Vec::new();
     };
-    let Some(atts) = v.get("attachments").and_then(|a| a.as_array()) else {
+    let Some(embeds) = v.get("embeds").and_then(|e| e.as_array()) else {
         return Vec::new();
     };
-    atts.iter()
-        .filter(|a| {
-            a.get("filename")
-                .and_then(|f| f.as_str())
-                .is_some_and(crate::render::is_image_filename)
-        })
-        .filter_map(|a| a.get("url").and_then(|u| u.as_str()).map(String::from))
+    embeds
+        .iter()
+        .filter_map(|e| e.get("image")?.get("url")?.as_str().map(String::from))
         .collect()
 }
 
@@ -393,4 +403,29 @@ fn retry_after_secs(r: &reqwest::Response) -> Option<f64> {
         .get("Retry-After")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<f64>().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_embed_image_urls, parse_message_id};
+
+    #[test]
+    fn extracts_cdn_image_url_from_embed() {
+        // Discord empties top-level `attachments` and moves the resolved CDN url
+        // into embeds[].image.url once an attachment:// reference is consumed.
+        let resp = r#"{"id":"999","attachments":[],"embeds":[
+            {"type":"rich","description":"x",
+             "image":{"url":"https://cdn.discordapp.com/attachments/1/2/photo.jpg"}}]}"#;
+        assert_eq!(parse_message_id(resp).as_deref(), Some("999"));
+        assert_eq!(
+            parse_embed_image_urls(resp),
+            vec!["https://cdn.discordapp.com/attachments/1/2/photo.jpg"]
+        );
+    }
+
+    #[test]
+    fn no_image_embed_yields_empty() {
+        let resp = r#"{"id":"1","embeds":[{"type":"rich","description":"text only"}]}"#;
+        assert!(parse_embed_image_urls(resp).is_empty());
+    }
 }
