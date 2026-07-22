@@ -237,13 +237,12 @@ impl Deliverer {
                 Ok(r) if r.status().as_u16() == 429 => {
                     rate_limit_attempts += 1;
                     if rate_limit_attempts >= MAX_429_ATTEMPTS {
-                        return Err(format!("rate limited beyond {} attempts", MAX_429_ATTEMPTS));
+                        return Err(format!("rate limited beyond {MAX_429_ATTEMPTS} attempts"));
                     }
                     let wait = retry_after_secs(&r).unwrap_or(1.0);
                     if rate_limit_cumulative_wait + wait > RATE_LIMIT_BUDGET_SECS {
                         return Err(format!(
-                            "rate limited beyond {:.1}s budget",
-                            RATE_LIMIT_BUDGET_SECS
+                            "rate limited beyond {RATE_LIMIT_BUDGET_SECS:.1}s budget"
                         ));
                     }
                     warn!(wait, "discord 429; honoring retry_after");

@@ -284,7 +284,7 @@ impl Config {
                 serde_yaml::Value::Number(n) => {
                     let id = n.as_i64().ok_or_else(|| ConfigError::InvalidFrom {
                         route: r.name.clone(),
-                        got: format!("number {}", n),
+                        got: format!("number {n}"),
                     })?;
                     ChatRef::Id(ChatId(id))
                 }
@@ -295,11 +295,11 @@ impl Config {
                     return Err(ConfigError::InvalidFrom {
                         route: r.name.clone(),
                         got: match other {
-                            serde_yaml::Value::Bool(b) => format!("boolean {}", b),
+                            serde_yaml::Value::Bool(b) => format!("boolean {b}"),
                             serde_yaml::Value::Null => "null".to_string(),
                             serde_yaml::Value::Sequence(_) => "sequence/array".to_string(),
                             serde_yaml::Value::Mapping(_) => "mapping/object".to_string(),
-                            _ => format!("{:?}", other),
+                            _ => format!("{other:?}"),
                         },
                     })
                 }
