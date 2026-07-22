@@ -1366,6 +1366,17 @@ struct CoalescedAlbum {
 /// every item (every webhook any matching route selected gets the album exactly
 /// once, instead of everything going to the first item's targets). Returns
 /// `None` for an empty batch.
+/// Insert `_{msg_id}` before a filename's extension to break a within-album
+/// name collision (`report.pdf` → `report_42.pdf`), so `attachment://` refs and
+/// multipart part names stay unique. Preserves the extension so
+/// [`render::is_image_filename`] still classifies it correctly.
+fn disambiguate_filename(name: &str, msg_id: i32) -> String {
+    match name.rsplit_once('.') {
+        Some((stem, ext)) => format!("{stem}_{msg_id}.{ext}"),
+        None => format!("{name}_{msg_id}"),
+    }
+}
+
 fn coalesce_album(mut batch: Vec<MediaItem>) -> Option<CoalescedAlbum> {
     // Canonical album order; also pairs the caption with the lowest msg_id.
     sort_album_batch(&mut batch);
@@ -1378,10 +1389,20 @@ fn coalesce_album(mut batch: Vec<MediaItem>) -> Option<CoalescedAlbum> {
     // still anchor the caption + fan-out targets below.
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     let mut seen_ids: HashSet<i32> = HashSet::new();
+    let mut seen_names: HashSet<String> = HashSet::new();
     for it in &batch {
         if let Some((filename, bytes)) = &it.file {
             if seen_ids.insert(it.msg_id) {
-                files.push((filename.clone(), bytes.clone()));
+                // Two documents in one album can share an original filename;
+                // that would collide the `attachment://name` embed references
+                // (Discord resolves them ambiguously). Disambiguate by msg_id.
+                let name = if seen_names.insert(filename.clone()) {
+                    filename.clone()
+                } else {
+                    disambiguate_filename(filename, it.msg_id)
+                };
+                seen_names.insert(name.clone());
+                files.push((name, bytes.clone()));
             }
         }
     }
@@ -1489,7 +1510,13 @@ async fn deliver_coalesced_media(
         // whole album one message either way).
         let deliver_files = t.mode == MediaMode::Reupload && !files.is_empty();
         let body = if deliver_files {
-            caption.to_string()
+            // A mixed-size album can post some files while others were skipped
+            // for being oversized — say so, rather than silently dropping them.
+            if any_oversized {
+                media_notice_body(caption, "⚠️ some files were too large to relay")
+            } else {
+                caption.to_string()
+            }
         } else {
             media_notice_body(caption, media_notice_text(t.mode, any_oversized))
         };
@@ -1815,6 +1842,49 @@ mod backfill_tests {
 mod album_coalesce_tests {
     use super::*;
     use telegram_relay::config::ChatId;
+
+    #[test]
+    fn disambiguate_filename_breaks_collisions_keeping_extension() {
+        assert_eq!(disambiguate_filename("report.pdf", 42), "report_42.pdf");
+        assert_eq!(disambiguate_filename("a.b.png", 7), "a.b_7.png");
+        assert_eq!(disambiguate_filename("noext", 5), "noext_5");
+        // extension preserved so image detection still works
+        assert!(render::is_image_filename(&disambiguate_filename(
+            "x.jpg", 9
+        )));
+    }
+
+    fn doc_item(msg_id: i32, filename: &str) -> MediaItem {
+        MediaItem {
+            grouped_id: Some(99),
+            msg_id,
+            chat: ChatId(-100),
+            file: Some((filename.to_string(), vec![1, 2, 3])),
+            oversized: false,
+            caption: String::new(),
+            deep_link: None,
+            title: "t".into(),
+            sender: None,
+            date: "2026-07-20T12:00:00Z".into(),
+            targets: vec![MediaTarget {
+                route: "r1".into(),
+                webhook: WebhookName("h".into()),
+                url: WebhookUrl("https://x/h".into()),
+                color: render::DEFAULT_EMBED_COLOR,
+                mode: MediaMode::Reupload,
+            }],
+        }
+    }
+
+    #[test]
+    fn same_named_documents_get_unique_filenames() {
+        // Two docs in one album sharing "report.pdf" must not collide.
+        let batch = vec![doc_item(1, "report.pdf"), doc_item(2, "report.pdf")];
+        let album = coalesce_album(batch).unwrap();
+        let names: Vec<&str> = album.files.iter().map(|f| f.0.as_str()).collect();
+        assert_eq!(names.len(), 2);
+        assert_ne!(names[0], names[1], "filenames must be disambiguated");
+    }
 
     fn media_item(msg_id: i32, caption: &str, hooks: &[&str]) -> MediaItem {
         MediaItem {
