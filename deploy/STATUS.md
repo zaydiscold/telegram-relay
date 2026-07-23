@@ -45,10 +45,11 @@ services too) and re-check `systemctl is-active telegram-relay` after boot.
 ## What it watches (routes)
 
 Source of truth: `config.yaml` (gitignored — contains the live routing table).
+Run `telegram-relay routes` to print the current wiring.
 
 | Route | Telegram source | → Discord |
 |---|---|---|
-| `robs-thoughts` | **Rob's Thoughts** channel (`-1002840386812`, `@robthinks`) | `#rc` webhook |
+| `example` | a channel you watch (`@handle` or numeric id) | one or more webhooks |
 
 To add a route: edit `config.yaml` and save. **Hot-reload picks it up within 5s —
 no restart.** (Adding/removing credentials or the session still needs a restart.)

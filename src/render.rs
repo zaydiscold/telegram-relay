@@ -565,7 +565,7 @@ mod tests {
         EmbedMeta {
             title: "Rob's Channel".into(),
             avatar_url: None,
-            deep_link: Some("https://t.me/robthinks/42".into()),
+            deep_link: Some("https://t.me/example/42".into()),
             reactions: reactions(&[("❤️", 47), ("🔥", 12)]),
             comment_count: 8,
             deleted: false,
@@ -625,14 +625,14 @@ mod tests {
         assert_eq!(arr.len(), 1);
         let e = &arr[0];
         assert_eq!(e["author"]["name"], "Rob's Channel");
-        assert_eq!(e["author"]["url"], "https://t.me/robthinks/42");
+        assert_eq!(e["author"]["url"], "https://t.me/example/42");
         assert_eq!(e["description"], "gm frens");
         let footer = e["footer"]["text"].as_str().unwrap();
         assert!(footer.starts_with("by zayd — "));
         assert!(FOOTERS.contains(&&footer["by zayd — ".len()..]));
         let field_val = e["fields"][0]["value"].as_str().unwrap();
         assert!(field_val.contains("❤️ 47 · 🔥 12 · 💬 8"));
-        assert!(field_val.contains("[↗ View on Telegram](https://t.me/robthinks/42)"));
+        assert!(field_val.contains("[↗ View on Telegram](https://t.me/example/42)"));
     }
 
     #[test]
