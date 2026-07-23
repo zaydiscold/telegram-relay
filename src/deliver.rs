@@ -99,6 +99,13 @@ impl Deliverer {
     /// PATCH an already-posted embed message in place.
     ///
     /// `PATCH {webhook}/messages/{discord_msg_id}` with a new `embeds` array.
+    ///
+    /// `attachments: []` clears any standalone attachment. Media posts inline
+    /// their image via the embed's CDN url, but the original uploaded file stays
+    /// on the message; once the embed references it by CDN url instead of
+    /// `attachment://`, Discord un-consumes it and would render it a SECOND time
+    /// (a standalone image leaking above the embed). Clearing attachments here
+    /// leaves only the single inline embed image. Harmless no-op for text posts.
     pub async fn patch_embed(
         &self,
         url: &WebhookUrl,
@@ -106,7 +113,11 @@ impl Deliverer {
         embeds: serde_json::Value,
     ) -> Outcome {
         let target = format!("{}/messages/{discord_msg_id}", url.0);
-        let body = serde_json::json!({ "embeds": embeds, "allowed_mentions": { "parse": [] } });
+        let body = serde_json::json!({
+            "embeds": embeds,
+            "allowed_mentions": { "parse": [] },
+            "attachments": [],
+        });
         let resp = self.http.patch(&target).json(&body).send().await;
         match resp {
             Ok(r) if r.status().is_success() => Outcome::Delivered,
