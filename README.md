@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./assets/banner.svg" alt="telegram-relay" />
+</p>
+
 <h1 align="center">telegram-relay</h1>
 
 <p align="center">mirror telegram into discord, live — channels, groups, and DMs, as a real user over MTProto.</p>
@@ -10,124 +14,183 @@
 </p>
 
 <p align="center">
-  <a href="#how-fast">how fast</a> · <a href="#features">features</a> · <a href="#security--isolation">security</a> · <a href="#quickstart">quickstart</a> · <a href="#config-reference-configyaml">config</a> · <a href="#deploy">deploy</a>
+  <a href="#what-it-does">what it does</a> · <a href="#how-fast">how fast</a> · <a href="#features">features</a> · <a href="#security">security</a> · <a href="#quickstart">quickstart</a> · <a href="#config">config</a> · <a href="#deploy">deploy</a>
 </p>
 
 <br>
+<br>
 
-A fast Telegram → Discord relay in Rust. It logs in as a real Telegram user over
-MTProto — the same protocol the official Telegram Desktop app speaks — so it sees
-exactly what your own client sees: **channels, groups, and DMs**. It mirrors the
-chats you choose into Discord webhooks as branded, live-updating embeds. Single
-binary, local-first, no hosted component.
+<p align="center">
+  <img src="./assets/stars1.svg" alt="·" />
+</p>
 
-A bot can't do this. Telegram bots only see chats they've been added to and are
-blind to channels and DMs. Because this speaks MTProto as a user account, it can
-watch any chat you can — the point of relaying a channel you read but your Discord
-friends don't. Built to forward a crypto channel into a friend's Discord, running
-unattended on a box that's always on.
+<br>
+<br>
 
-## How fast
+## what it does
 
-There's nothing to poll. MTProto holds a persistent connection and Telegram
+logs in as a real telegram user over MTProto — the same protocol telegram desktop
+speaks — so it sees what your own client sees: **channels, groups, and DMs**. it
+mirrors the chats you pick into discord webhooks as branded, live-updating embeds.
+single binary, local-first, no hosted anything.
+
+a bot can't do this. telegram bots only see chats they've been added to and are
+blind to channels and DMs. because this speaks MTProto as a user account, it can
+watch any chat you can — the whole point of relaying a channel you read but your
+discord friends don't.
+
+built to forward a crypto channel into a friend's discord. runs unattended on a
+box that's always on.
+
+<br>
+<br>
+
+<p align="center">
+  <img src="./assets/stars2.svg" alt="·" />
+</p>
+
+<br>
+<br>
+
+## how fast
+
+there's nothing to poll. MTProto holds a persistent connection and telegram
 *pushes* new messages down it, so the relay reacts the instant a message is
-published rather than on an interval. End to end — Telegram publish to Discord
-accept — is typically well under a second on a warm connection. The `stats`
-command reports the real measured distribution (p50/p95/max) from your own
-traffic, computed from two independent authoritative clocks (Telegram's publish
-timestamp and Discord's message snowflake) — so it never depends on the relay
-host's own clock.
+published — not on an interval. end to end, telegram publish to discord accept, is
+typically well under a second on a warm connection.
 
-## Features
+`telegram-relay stats` reports the real measured spread (p50/p95/max) from your own
+traffic, computed from two independent authoritative clocks — telegram's publish
+timestamp and discord's message snowflake — so it never depends on the relay host's
+own clock.
 
-| Feature | What it does |
+<br>
+<br>
+
+<p align="center">
+  <img src="./assets/stars3.svg" alt="·" />
+</p>
+
+<br>
+<br>
+
+## features
+
+| feature | what it does |
 |---|---|
-| Live-updating embeds | Each post becomes a Discord embed with the source channel's name + photo as the webhook identity, a colored stripe, the original Telegram timestamp, a link back to Telegram, and a reaction/comment stats line. |
-| State-aware colors | The stripe encodes state: regular posts are purple, an **edited** post turns orange, a **deleted** one turns red and says so. The color transitions in place as the source changes — read what happened without opening Telegram. |
-| Reactions, edits, deletes | A background worker re-checks tracked posts and PATCHes the embed in place. Reactions settle over the first hour; edits and deletes tracked for two days. |
-| Real media, inline | Photos and videos relay as attachments *inside* the embed. Multi-image albums coalesce into one gallery. Link-only posts relay as text so Discord renders its own preview. |
-| Fan-in / fan-out | One source can feed several channels; several sources can feed one. Per-webhook dedup means adding a webhook to a route doesn't re-spam the others. |
-| Per-route identity | Each route gets its own webhook avatar (the channel photo) and stripe color, so several sources funneled into one channel stay distinguishable. |
-| Catch-up + dedup | Reconnects replay missed messages (Telegram's native catch-up); a durable store guards against double-posting, even across restarts. |
-| Hot-reload | Routes and filters re-read from `config.yaml` on a timer — add a channel without restarting. |
-| Backfill | `backfill <route> --count N` relays the last N posts of a channel on demand. |
+| live-updating embeds | each post becomes a discord embed with the source channel's name + photo as the webhook identity, a colored stripe, the original telegram timestamp, a link back to telegram, and a reaction/comment stats line. |
+| state-aware colors | the stripe encodes state: regular posts are purple, an **edited** post turns orange, a **deleted** one turns red and says so. the color transitions in place as the source changes — read what happened without opening telegram. |
+| reactions, edits, deletes | a background worker re-checks tracked posts and PATCHes the embed in place. reactions settle over the first hour; edits and deletes tracked for two days. |
+| real media, inline | photos and videos relay as attachments *inside* the embed. multi-image albums coalesce into one gallery. link-only posts relay as text so discord renders its own preview. |
+| fan-in / fan-out | one source can feed several channels; several sources can feed one. per-webhook dedup means adding a webhook to a route doesn't re-spam the others. |
+| per-route identity | each route gets its own webhook avatar (the channel photo) and stripe color, so several sources funneled into one channel stay distinguishable. |
+| catch-up + dedup | reconnects replay missed messages (telegram's native catch-up); a durable store guards against double-posting, even across restarts. |
+| hot-reload | routes and filters re-read from `config.yaml` on a timer — add a channel without restarting. |
+| backfill | `backfill <route> --count N` relays the last N posts of a channel on demand. |
 
-## Security & isolation
+<br>
+<br>
 
-Logging in as your account means being careful with the reach that grants:
+<p align="center">
+  <img src="./assets/stars4.svg" alt="·" />
+</p>
 
-- **Only the chats you configure are ever touched.** Every incoming update is
-  matched against your routes *before* any work happens — a message from any
-  other chat your account is in is dropped immediately, before a byte of its
-  media is fetched.
-- **Media never lands on disk.** Attachments are streamed into memory, posted,
-  and dropped — never decoded, parsed, or executed. Per-route `mode: placeholder`
-  relays a link instead and downloads nothing.
-- **The session file is your account.** Written owner-only (`chmod 600`), never
-  committed, never leaves the machine. Revoke any time from Telegram → Settings →
-  Devices.
-- **Webhook tokens never leak.** The types holding webhook URLs won't print them;
-  every error, log line, and ops notice is URL-stripped first — enforced in the
-  type system, not by convention.
-- **Hardened service** (`ProtectSystem=strict`, `PrivateTmp=true`,
-  `NoNewPrivileges=true`) and **no phone-home** — messages go only to the webhooks
-  you configure.
+<br>
+<br>
 
-## Quickstart
+## security
 
-1. Get API credentials at <https://my.telegram.org> (API Development Tools → create
-   an app) — an `api_id` and `api_hash`.
-2. Create `.env` next to the binary:
+logging in as your account means being careful with the reach that grants:
+
+- **only the chats you configure are ever touched.** every incoming update is matched
+  against your routes *before* any work happens — a message from any other chat your
+  account is in is dropped immediately, before a byte of its media is fetched.
+- **media never lands on disk.** attachments stream into memory, get posted, and are
+  dropped — never decoded, parsed, or executed. per-route `mode: placeholder` relays a
+  link instead and downloads nothing.
+- **the session file is your account.** written owner-only (`chmod 600`), never
+  committed, never leaves the machine. revoke any time from telegram → settings → devices.
+- **webhook tokens never leak.** the types holding webhook urls won't print them; every
+  error, log line, and ops notice is url-stripped first — enforced in the type system,
+  not by convention.
+- **hardened service** (`ProtectSystem=strict`, `PrivateTmp=true`, `NoNewPrivileges=true`)
+  and **no phone-home** — messages go only to the webhooks you configure.
+
+<br>
+<br>
+
+<p align="center">
+  <img src="./assets/stars5.svg" alt="·" />
+</p>
+
+<br>
+<br>
+
+## quickstart
+
+1. get api credentials at [my.telegram.org](https://my.telegram.org) (api development
+   tools → create an app) — an `api_id` and `api_hash`.
+2. create `.env` next to the binary:
    ```
    TELEGRAM_API_ID=12345
    TELEGRAM_API_HASH=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
    DISCORD_WEBHOOK_MAIN=https://discord.com/api/webhooks/…
    DISCORD_WEBHOOK_OPS=https://discord.com/api/webhooks/…   # optional
    ```
-3. Copy `config.example.yaml` to `config.yaml` and set your routes.
-4. Log in once (phone → code → optional 2FA): `telegram-relay login`
-5. Inspect and validate (none of these send anything):
+3. copy `config.example.yaml` to `config.yaml` and set your routes.
+4. log in once (phone → code → optional 2FA): `telegram-relay login`
+5. inspect and validate — none of these send anything:
    ```
    telegram-relay chats     # every dialog + its id
    telegram-relay routes    # ASCII wiring diagram (fan-in / fan-out)
    telegram-relay check     # validate webhooks + routes; exit 0/1
    ```
-6. Run it: `telegram-relay run`
+6. run it: `telegram-relay run`
 
-## Commands
+**commands**
 
-| Command | Purpose |
+| command | purpose |
 |---|---|
-| `run` | Run the relay (what the service invokes). |
-| `login` | One-time interactive login; writes the session file. |
-| `chats` | List every dialog with its numeric id. |
+| `run` | run the relay (what the service invokes). |
+| `login` | one-time interactive login; writes the session file. |
+| `chats` | list every dialog with its numeric id. |
 | `routes` | ASCII diagram of the routing (source → webhooks); no session needed. |
-| `check` | Validate config + webhooks (+ routes); exit 0/1. Sends nothing. |
-| `stats` | Tracked-post counts and measured relay latency (p50/p95/max). |
-| `backfill <route> [--count N]` | Relay the last N posts of a route on demand. |
+| `check` | validate config + webhooks (+ routes); exit 0/1. sends nothing. |
+| `stats` | tracked-post counts and measured relay latency (p50/p95/max). |
+| `backfill <route> [--count N]` | relay the last N posts of a route on demand. |
 
-## Config reference (`config.yaml`)
+<br>
+<br>
 
-| Key | Meaning |
+<p align="center">
+  <img src="./assets/stars1.svg" alt="·" />
+</p>
+
+<br>
+<br>
+
+## config
+
+`config.yaml`:
+
+| key | meaning |
 |---|---|
-| `routes[].name` | Label for the route (used in logs). |
-| `routes[].from` | Source chat: `"@username"` or a numeric chat id. |
-| `routes[].to` | Webhook names (from `webhooks:`) to fan out to. |
-| `routes[].color` | Optional `"#RRGGBB"` stripe for regular posts; defaults `#9b7dff`. Edited/deleted state colors override it. |
-| `routes[].mode` | Optional `reupload` / `placeholder`; overrides the global `media.mode`. |
-| `routes[].filter` | Optional `any_keywords` / `exclude_hashtags`. |
-| `webhooks.<name>.env` | Env var holding that webhook's URL. |
-| `ops_webhook.env` | Optional webhook for error/failure notices only. |
+| `routes[].name` | label for the route (used in logs). |
+| `routes[].from` | source chat: `"@username"` or a numeric chat id. |
+| `routes[].to` | webhook names (from `webhooks:`) to fan out to. |
+| `routes[].color` | optional `"#RRGGBB"` stripe for regular posts; defaults `#9b7dff`. edited/deleted state colors override it. |
+| `routes[].mode` | optional `reupload` / `placeholder`; overrides the global `media.mode`. |
+| `routes[].filter` | optional `any_keywords` / `exclude_hashtags`. |
+| `webhooks.<name>.env` | env var holding that webhook's url. |
+| `ops_webhook.env` | optional webhook for error/failure notices only. |
 | `media.mode` | `reupload` (download + inline) or `placeholder` (link only). |
-| `media.max_bytes` | Above this, fall back to a link instead of re-uploading. |
-| `refresh.interval_mins` | Edit/delete re-check cadence (default 30). |
-| `refresh.horizon_hours` | Stop tracking posts older than this (default 48). |
-| `refresh.reaction_horizon_mins` | Stop refreshing reactions after this (default 60). |
-| `store.path` | SQLite file tracking relayed posts (default `relay.db`). |
+| `media.max_bytes` | above this, fall back to a link instead of re-uploading. |
+| `refresh.interval_mins` | edit/delete re-check cadence (default 30). |
+| `refresh.horizon_hours` | stop tracking posts older than this (default 48). |
+| `refresh.reaction_horizon_mins` | stop refreshing reactions after this (default 60). |
+| `store.path` | sqlite file tracking relayed posts (default `relay.db`). |
 
-### Routing recipes
-
-All three shapes work with no code — they're just how you write `routes`:
+all three routing shapes work with no code — they're just how you write `routes`:
 
 ```yaml
 # one source -> one channel
@@ -139,22 +202,40 @@ All three shapes work with no code — they're just how you write `routes`:
 - { name: split, from: "@alpha", to: [chan_a, chan_b] }
 ```
 
-## Deploy
+`telegram-relay routes` prints the resulting wiring and flags every fan-in and fan-out.
 
-`deploy/` has a systemd unit, a failure-alert unit that posts to your ops webhook
-when the relay goes down (`telegram-relay-alert@.service` + `relay-alert.sh`), and
-`status.sh` for a health dashboard. Build with `cargo build --release`, put `.env`,
+<br>
+<br>
+
+<p align="center">
+  <img src="./assets/stars2.svg" alt="·" />
+</p>
+
+<br>
+<br>
+
+## deploy
+
+`deploy/` has a systemd unit, a failure-alert unit that posts to your ops webhook when
+the relay goes down (`telegram-relay-alert@.service` + `relay-alert.sh`), and
+`status.sh` for a health dashboard. build with `cargo build --release`, put `.env`,
 `config.yaml`, and the session file next to the binary. `deploy/STATUS.md` documents
-the boot chain. Silence means healthy — it posts only when a message is relayed or
-something is actually wrong.
+the boot chain.
 
-## Non-goals
+silence means healthy — it posts only when a message is relayed, or when something is
+actually wrong.
 
-- Not a full client (no sending from Discord back into Telegram).
-- Not multi-account (one session per instance).
-- Not a hosted service (no dashboard, no cloud).
-- Not a bot integration — MTProto as a user account, on purpose, to watch chats a
-  bot could never join.
+**non-goals:** not a full client (no sending from discord back into telegram), not
+multi-account (one session per instance), not a hosted service (no dashboard, no cloud),
+not a bot integration — MTProto as a user account, on purpose, to watch chats a bot
+could never join.
+
+<br>
+<br>
+
+<p align="center">
+  <img src="./assets/wisps.svg" alt="" />
+</p>
 
 <br>
 <br>
@@ -180,8 +261,8 @@ something is actually wrong.
   ☑ systemd deploy + failure watchdog<br>
   ☐ cold-reboot test of the boot chain<br>
   ☐ refresh CDN image urls past the 24h signature window<br>
-  ☐ optional Docker isolation for media<br>
-  ☐ Telegram → Discord entity/markdown conversion
+  ☐ optional docker isolation for media<br>
+  ☐ telegram → discord entity/markdown conversion
   </sub>
 </p>
 
