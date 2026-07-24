@@ -185,6 +185,12 @@ impl Store {
             .context("enabling WAL mode")?;
         conn.pragma_update(None, "synchronous", "NORMAL")
             .context("setting synchronous=NORMAL")?;
+        // `backfill` runs as a separate process against the same db as the live
+        // daemon. WAL serializes writers, so without a busy timeout the second
+        // writer gets SQLITE_BUSY instantly — dropping a row (no refresh) and
+        // re-posting it later (dup). Wait for the lock instead of failing.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .context("setting busy_timeout")?;
         restrict_db_permissions(path);
         conn.execute_batch(
             r#"
@@ -209,6 +215,13 @@ impl Store {
               webhook_name TEXT PRIMARY KEY,
               identity_hash TEXT NOT NULL,
               updated_at INTEGER NOT NULL);
+
+            -- The refresh worker scans due() every base tick (<=60s) filtering on
+            -- (deleted=0, posted_at); without this a growing store is a full scan
+            -- + JSON-decode of every live row once a minute. Partial index keeps
+            -- only the active rows the worker actually looks at.
+            CREATE INDEX IF NOT EXISTS idx_relayed_active
+              ON relayed(posted_at) WHERE deleted = 0;
             "#,
         )
         .context("creating relayed table")?;
@@ -272,7 +285,7 @@ impl Store {
     /// Record a freshly-posted Discord message. Idempotent on the primary key.
     pub fn record(&self, rec: NewRecord) -> Result<()> {
         let now = now_secs();
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             r#"
             INSERT INTO relayed
@@ -313,7 +326,7 @@ impl Store {
         tg_msg_id: i32,
         webhook_name: &str,
     ) -> Result<bool> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let exists: bool = conn
             .query_row(
                 r#"
@@ -334,7 +347,7 @@ impl Store {
     /// Ordered by `chat_id, tg_msg_id` so the refresh worker can batch by chat.
     pub fn due(&self, horizon_hours: u64) -> Result<Vec<TrackedMsg>> {
         let cutoff = now_secs() - (horizon_hours as i64) * 3600;
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             r#"
             SELECT chat_id, tg_msg_id, route, webhook_name, discord_msg_id,
@@ -379,7 +392,7 @@ impl Store {
         comment_count: i32,
     ) -> Result<()> {
         let now = now_secs();
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             r#"
             UPDATE relayed
@@ -408,7 +421,7 @@ impl Store {
     /// otherwise a checkpoint would re-fire every base tick.
     pub fn touch_checked(&self, chat_id: i64, tg_msg_id: i32, discord_msg_id: &str) -> Result<()> {
         let now = now_secs();
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "UPDATE relayed SET last_checked = ?4 WHERE chat_id = ?1 AND tg_msg_id = ?2 AND discord_msg_id = ?3",
             rusqlite::params![chat_id, tg_msg_id, discord_msg_id, now],
@@ -417,25 +430,34 @@ impl Store {
         Ok(())
     }
 
-    /// Mark a Telegram post as edited (all its Discord messages), so later
+    /// Mark ONE Discord message (a single fan-out copy) as edited, so later
     /// stats-only refreshes keep the edited stripe instead of reverting it.
-    pub fn mark_edited(&self, chat_id: i64, tg_msg_id: i32) -> Result<()> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+    ///
+    /// Keyed on `discord_msg_id`, not the whole `(chat, tg_msg)` group: each
+    /// fan-out sibling has its own cadence, so flipping the shared group would
+    /// mark siblings that this tick never actually PATCHed (they'd then drop out
+    /// of `due()` and their Discord embed would never get the edit). Every
+    /// sibling flips itself when its own row is the one being refreshed.
+    pub fn mark_edited(&self, chat_id: i64, tg_msg_id: i32, discord_msg_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
-            "UPDATE relayed SET edited = 1 WHERE chat_id = ?1 AND tg_msg_id = ?2",
-            rusqlite::params![chat_id, tg_msg_id],
+            "UPDATE relayed SET edited = 1 WHERE chat_id = ?1 AND tg_msg_id = ?2 AND discord_msg_id = ?3",
+            rusqlite::params![chat_id, tg_msg_id, discord_msg_id],
         )
         .context("marking edited")?;
         Ok(())
     }
 
-    /// Mark every Discord message for a Telegram post as deleted (all routes).
-    pub fn mark_deleted(&self, chat_id: i64, tg_msg_id: i32) -> Result<()> {
+    /// Mark ONE Discord message (a single fan-out copy) as deleted. Keyed on
+    /// `discord_msg_id` for the same reason as [`mark_edited`](Self::mark_edited):
+    /// only tombstone the copy this tick actually PATCHed, so a not-yet-due
+    /// sibling isn't flipped-then-excluded from `due()` before it gets tombstoned.
+    pub fn mark_deleted(&self, chat_id: i64, tg_msg_id: i32, discord_msg_id: &str) -> Result<()> {
         let now = now_secs();
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
-            "UPDATE relayed SET deleted = 1, last_checked = ?3 WHERE chat_id = ?1 AND tg_msg_id = ?2",
-            rusqlite::params![chat_id, tg_msg_id, now],
+            "UPDATE relayed SET deleted = 1, last_checked = ?4 WHERE chat_id = ?1 AND tg_msg_id = ?2 AND discord_msg_id = ?3",
+            rusqlite::params![chat_id, tg_msg_id, discord_msg_id, now],
         )
         .context("marking deleted")?;
         Ok(())
@@ -444,7 +466,7 @@ impl Store {
     /// Drop rows older than `horizon_hours` (they are no longer refreshed).
     pub fn prune(&self, horizon_hours: u64) -> Result<usize> {
         let cutoff = now_secs() - (horizon_hours as i64) * 3600;
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let n = conn
             .execute("DELETE FROM relayed WHERE posted_at < ?1", [cutoff])
             .context("pruning old rows")?;
@@ -460,7 +482,7 @@ impl Store {
     /// Used to skip the webhook avatar/name PATCH when the source channel's
     /// title + photo are unchanged since the last sync.
     pub fn webhook_identity_hash(&self, webhook_name: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let hash = conn
             .query_row(
                 "SELECT identity_hash FROM webhook_identity WHERE webhook_name = ?1",
@@ -474,7 +496,7 @@ impl Store {
     /// Record the identity hash just pushed to `webhook_name` (upsert).
     pub fn set_webhook_identity_hash(&self, webhook_name: &str, identity_hash: &str) -> Result<()> {
         let now = now_secs();
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             r#"
             INSERT INTO webhook_identity (webhook_name, identity_hash, updated_at)
@@ -496,7 +518,7 @@ impl Store {
     /// Latency percentiles cover only rows with a recorded `latency_ms` (live
     /// relays); backfilled rows have `NULL` and are excluded.
     pub fn stats(&self) -> Result<StoreStats> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tracked_posts: i64 = conn
             .query_row(
                 "SELECT COUNT(DISTINCT chat_id || ':' || tg_msg_id) FROM relayed",
@@ -525,7 +547,7 @@ impl Store {
 
     /// Test/diagnostic helper: total row count.
     pub fn count(&self) -> Result<i64> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let n = conn.query_row("SELECT COUNT(*) FROM relayed", [], |r| r.get(0))?;
         Ok(n)
     }
@@ -534,7 +556,7 @@ impl Store {
     /// prune/due horizon behaviour can be exercised without real time passing.
     #[cfg(test)]
     fn backdate_all(&self, secs: i64) {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute("UPDATE relayed SET posted_at = posted_at - ?1", [secs])
             .unwrap();
     }
@@ -613,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn mark_deleted_excludes_from_due() {
+    fn mark_deleted_is_per_sibling() {
         let path = tmp_db("deleted");
         let _ = std::fs::remove_file(&path);
         let store = Store::open(&path).unwrap();
@@ -622,10 +644,14 @@ mod tests {
         store.record(rec(1, 1, "d-b")).unwrap();
         assert_eq!(store.due(48).unwrap().len(), 2);
 
-        store.mark_deleted(1, 1).unwrap();
-        // still present in the table, but excluded from due()
-        assert_eq!(store.count().unwrap(), 2);
-        assert_eq!(store.due(48).unwrap().len(), 0);
+        // Deleting one fan-out copy excludes ONLY that copy from due(); the
+        // sibling stays active until its own row is tombstoned in its own tick.
+        store.mark_deleted(1, 1, "d-a").unwrap();
+        assert_eq!(store.count().unwrap(), 2, "both rows still present");
+        assert_eq!(store.due(48).unwrap().len(), 1, "sibling still due");
+
+        store.mark_deleted(1, 1, "d-b").unwrap();
+        assert_eq!(store.due(48).unwrap().len(), 0, "both now tombstoned");
 
         let _ = std::fs::remove_file(&path);
     }
@@ -639,7 +665,7 @@ mod tests {
         store.record(rec(1, 1, "d-a")).unwrap();
         assert!(!store.due(48).unwrap()[0].edited, "starts un-edited");
 
-        store.mark_edited(1, 1).unwrap();
+        store.mark_edited(1, 1, "d-a").unwrap();
         assert!(store.due(48).unwrap()[0].edited, "edited flag persisted");
 
         // A later stats-only update must NOT clear the edited flag (the bug:
@@ -881,7 +907,7 @@ mod tests {
         store.record(b).unwrap();
         store.record(rec(200, 9, "d-c")).unwrap(); // backfill-style: NULL latency
 
-        store.mark_deleted(200, 9).unwrap();
+        store.mark_deleted(200, 9, "d-c").unwrap();
 
         let s = store.stats().unwrap();
         assert_eq!(s.tracked_posts, 2, "distinct (chat,tg) posts");

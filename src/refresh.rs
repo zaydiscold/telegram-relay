@@ -454,7 +454,17 @@ async fn apply(
         return Ok(());
     }
     let Some(url) = webhooks.get(&WebhookName(row.webhook_name.clone())) else {
+        // A row whose webhook is no longer in config (renamed/removed at runtime,
+        // or left over from an older config) can't be PATCHed. Advance
+        // last_checked so it isn't re-fetched from Telegram every base tick
+        // (flood-wait risk); tombstone it on delete so it leaves due(). Either
+        // way the row ages out at the horizon.
         warn!(hook = %row.webhook_name, "refresh: unknown webhook; skipping patch");
+        if *action == RefreshAction::Deleted {
+            store.mark_deleted(row.chat_id, row.tg_msg_id, &row.discord_msg_id)?;
+        } else {
+            store.touch_checked(row.chat_id, row.tg_msg_id, &row.discord_msg_id)?;
+        }
         return Ok(());
     };
     let color = color_for(colors, &row.route);
@@ -484,9 +494,15 @@ async fn apply(
                 timestamp: None,
             };
             let mut embed = render::embed(&text, &meta);
-            reattach_stored_images(&mut embed, row, None);
-            patch(deliverer, url, &row.discord_msg_id, embed).await;
-            store.mark_deleted(row.chat_id, row.tg_msg_id)?;
+            let keeps = reattach_stored_media(&mut embed, row, None);
+            if patch(deliverer, url, &row.discord_msg_id, embed, &keeps).await {
+                store.mark_deleted(row.chat_id, row.tg_msg_id, &row.discord_msg_id)?;
+            } else {
+                // Transient drop: keep the row due so the tombstone retries on the
+                // next cadence tick, but advance last_checked so it isn't retried
+                // every base tick.
+                store.touch_checked(row.chat_id, row.tg_msg_id, &row.discord_msg_id)?;
+            }
         }
         RefreshAction::Edited | RefreshAction::StatsChanged => {
             let f = fetched.expect("edited/stats implies a fetched post");
@@ -498,9 +514,6 @@ async fn apply(
             // stats-only refresh must not revert the stripe. So OR the freshly
             // detected edit with the persisted flag.
             let is_edited = row.edited || *action == RefreshAction::Edited;
-            if *action == RefreshAction::Edited && !row.edited {
-                store.mark_edited(row.chat_id, row.tg_msg_id)?;
-            }
             let text = RelayText {
                 sender: None,
                 body: f.body.clone(),
@@ -518,41 +531,99 @@ async fn apply(
                 timestamp: f.date.clone(),
             };
             let mut embed = render::embed(&text, &meta);
-            reattach_stored_images(&mut embed, row, f.deep_link.as_deref());
-            patch(deliverer, url, &row.discord_msg_id, embed).await;
-            store.update_stats(
-                row.chat_id,
-                row.tg_msg_id,
-                &row.discord_msg_id,
-                &content_hash(&f.body),
-                &f.reactions,
-                comment_count,
-            )?;
+            let keeps = reattach_stored_media(&mut embed, row, f.deep_link.as_deref());
+            if patch(deliverer, url, &row.discord_msg_id, embed, &keeps).await {
+                // Persist state ONLY once the PATCH landed. If it dropped, we must
+                // not advance content_hash or the change becomes undetectable and
+                // the embed shows stale content forever.
+                if *action == RefreshAction::Edited && !row.edited {
+                    store.mark_edited(row.chat_id, row.tg_msg_id, &row.discord_msg_id)?;
+                }
+                store.update_stats(
+                    row.chat_id,
+                    row.tg_msg_id,
+                    &row.discord_msg_id,
+                    &content_hash(&f.body),
+                    &f.reactions,
+                    comment_count,
+                )?;
+            } else {
+                // Advance last_checked (retry on cadence, not every base tick) but
+                // leave content_hash/reactions unchanged so the change is
+                // re-detected and the PATCH retried.
+                store.touch_checked(row.chat_id, row.tg_msg_id, &row.discord_msg_id)?;
+            }
         }
     }
     Ok(())
 }
 
-/// Re-reference a tracked post's images (by their stored Discord CDN url) inside
-/// the embed being PATCHed. A PATCH sends no attachments, so without this the
-/// `attachment://` image from the original post would be stripped on every
-/// reaction/edit/delete update.
-fn reattach_stored_images(embed: &mut serde_json::Value, row: &TrackedMsg, gallery: Option<&str>) {
-    if row.image_urls.is_empty() {
-        return;
+/// Parse a Discord CDN attachment url into `(attachment_id, filename)`.
+///
+/// Format: `https://cdn.discordapp.com/attachments/{channel}/{attachment_id}/{filename}?…`.
+/// The id + filename let a PATCH keep the existing attachment (so its image
+/// isn't deleted) and reference it via `attachment://filename`.
+fn parse_cdn_ref(url: &str) -> Option<(String, String)> {
+    let path = url.split('?').next()?;
+    let mut segs = path.rsplit('/');
+    let filename = segs.next()?.to_string();
+    let attachment_id = segs.next()?.to_string();
+    if filename.is_empty() || attachment_id.is_empty() {
+        return None;
     }
-    let urls: Vec<&str> = row.image_urls.iter().map(String::as_str).collect();
-    render::attach_image_urls(embed, &urls, gallery);
+    Some((attachment_id, filename))
 }
 
+/// Re-reference a tracked post's media inside the embed being PATCHed, and
+/// return the `(id, filename)` of EVERY attachment so the PATCH can KEEP them.
+///
+/// A PATCH replaces the message: any attachment not listed in the request is
+/// deleted by Discord. So we keep every stored attachment (image AND video/doc),
+/// or a refresh would blank a video post. Only images can render inside an embed,
+/// so only they get an `attachment://filename` image reference — a video pointed
+/// at `embed.image.url` would show a broken-image icon; kept-but-unreferenced, it
+/// stays attached below the embed exactly as on the original post.
+fn reattach_stored_media(
+    embed: &mut serde_json::Value,
+    row: &TrackedMsg,
+    gallery: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut keeps = Vec::new();
+    let mut refs = Vec::new();
+    for url in &row.image_urls {
+        if let Some((id, filename)) = parse_cdn_ref(url) {
+            if render::is_image_filename(&filename) {
+                refs.push(format!("attachment://{filename}"));
+            }
+            keeps.push((id, filename));
+        }
+    }
+    if !refs.is_empty() {
+        let ref_strs: Vec<&str> = refs.iter().map(String::as_str).collect();
+        render::attach_image_urls(embed, &ref_strs, gallery);
+    }
+    keeps
+}
+
+/// PATCH the embed; return `true` iff Discord accepted it. A `false` return tells
+/// the caller to keep the change detectable and retry on the next cadence tick
+/// rather than committing state for an update that never landed.
 async fn patch(
     deliverer: &Arc<Deliverer>,
     url: &WebhookUrl,
     discord_msg_id: &str,
     embed: serde_json::Value,
-) {
-    if let Outcome::Dropped { reason } = deliverer.patch_embed(url, discord_msg_id, embed).await {
-        warn!(%reason, discord_msg_id, "refresh PATCH dropped");
+    keep_attachments: &[(String, String)],
+) -> bool {
+    match deliverer
+        .patch_embed(url, discord_msg_id, embed, keep_attachments)
+        .await
+    {
+        Outcome::Delivered => true,
+        Outcome::Dropped { reason } => {
+            warn!(%reason, discord_msg_id, "refresh PATCH dropped");
+            false
+        }
     }
 }
 
@@ -795,5 +866,25 @@ mod tests {
         assert!(out[0].is_some());
         assert!(out[1].is_none()); // unknown id -> None
         assert!(out[2].is_none()); // explicitly deleted
+    }
+}
+
+#[cfg(test)]
+mod cdn_tests {
+    use super::parse_cdn_ref;
+
+    #[test]
+    fn parses_attachment_id_and_filename() {
+        let url = "https://cdn.discordapp.com/attachments/1509631097175277570/1529719845296275457/photo.jpg?ex=1&is=2&hm=abc";
+        assert_eq!(
+            parse_cdn_ref(url),
+            Some(("1529719845296275457".into(), "photo.jpg".into()))
+        );
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert_eq!(parse_cdn_ref(""), None);
+        assert_eq!(parse_cdn_ref("https://x/"), None);
     }
 }

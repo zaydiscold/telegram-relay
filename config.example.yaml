@@ -1,5 +1,16 @@
+# copy to config.yaml and fill in. `telegram-relay routes` prints the wiring
+# below at any time — keep a plain-English routing table here as a comment so
+# the file documents itself:
+#
+#   by source — where each telegram channel goes:
+#     main-channel (@some_public_channel)  ->  main
+#
+#   by destination — what each discord channel receives:
+#     main  <-  main-channel
+
 routes:
   - name: main-channel
+    label: main-channel           # optional friendly name shown in `routes`
     from: "@some_public_channel"  # @username or numeric chat id (see `chats`)
     to: [main]                    # fan-out: list more webhook names for 1→N
     # Optional. Left-bar color for REGULAR posts from this route, as a quoted
@@ -21,7 +32,10 @@ routes:
   #   to: [main]
 
 webhooks:
-  main: { env: DISCORD_WEBHOOK_MAIN }
+  # `label` (optional) is the friendly destination name shown in `routes` — set
+  # it to the real server/channel, e.g. "lock-in #news", so the wiring reads in
+  # plain English. Defaults to the key ("main") when omitted.
+  main: { env: DISCORD_WEBHOOK_MAIN, label: "main" }
   # Add more names here and reference them from any route's `to:` list.
 
 ops_webhook: { env: DISCORD_WEBHOOK_OPS }   # optional: startup/error notices

@@ -294,7 +294,7 @@ async fn patch_embed_hits_messages_endpoint() {
 
     let d = Deliverer::new();
     let embeds = serde_json::json!([{ "description": "edited" }]);
-    let out = d.patch_embed(&WebhookUrl(url), "12345", embeds).await;
+    let out = d.patch_embed(&WebhookUrl(url), "12345", embeds, &[]).await;
     assert!(matches!(out, Outcome::Delivered));
     let bodies = hits.0.lock().unwrap();
     assert_eq!(bodies.len(), 1);

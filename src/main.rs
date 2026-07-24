@@ -17,7 +17,7 @@ use anyhow::{anyhow, Context};
 use arc_swap::ArcSwap;
 use clap::Parser;
 use tokio::sync::{mpsc, Mutex};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use telegram_relay::cli::{clamp_backfill_count, Cli, Command, SESSION_FILE};
@@ -52,6 +52,15 @@ const ALBUM_WINDOW: Duration = Duration::from_secs(1);
 const DEDUP_CAP: usize = 8192;
 /// Capacity of the channel carrying downloaded media items back to the loop.
 const MEDIA_CHANNEL_CAP: usize = 64;
+/// After this much silence with no incoming update, actively probe Telegram to
+/// prove the connection is alive (grammers' own idle timeout is ~15 min, far too
+/// long for a relay). The probe also detects a revoked session and forces a
+/// reconnect if the socket dropped.
+const LIVENESS_PROBE: Duration = Duration::from_secs(120);
+/// Max media downloads in flight at once. Each buffers a whole file in memory, so
+/// this caps peak media memory at ~= permits * media.max_bytes and stops a burst
+/// of posts (or a catch-up backlog) from OOM-ing the host.
+const MAX_CONCURRENT_DOWNLOADS: usize = 6;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -176,6 +185,10 @@ async fn check(config_path: &Path) -> anyhow::Result<()> {
                                 for r in &res.routes {
                                     println!("{:<24}  {:<8}  chat {}", r.name, "ok", r.chat.0);
                                 }
+                                for f in &res.failures {
+                                    all_ok = false;
+                                    println!("{:<24}  {:<8}  {f}", "(unresolved)", "FAIL");
+                                }
                             }
                             Err(e) => {
                                 all_ok = false;
@@ -252,12 +265,14 @@ fn stats_cmd(config_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod routes_diagram_tests {
     use super::render_routes_ascii;
-    use telegram_relay::config::{ChatRef, RouteCfg, WebhookName};
+    use std::collections::HashMap;
+    use telegram_relay::config::{ChatId, ChatRef, RouteCfg, WebhookName};
     use telegram_relay::render::DEFAULT_EMBED_COLOR;
 
-    fn route(from: ChatRef, to: &[&str]) -> RouteCfg {
+    fn route(label: Option<&str>, from: ChatRef, to: &[&str]) -> RouteCfg {
         RouteCfg {
             name: "r".into(),
+            label: label.map(str::to_string),
             from,
             to: to.iter().map(|w| WebhookName(w.to_string())).collect(),
             filter: None,
@@ -266,28 +281,58 @@ mod routes_diagram_tests {
         }
     }
 
-    #[test]
-    fn diagram_shows_fan_in_and_fan_out() {
-        let routes = vec![
-            route(ChatRef::Username("rob".into()), &["main", "alerts"]), // fan-out
-            route(ChatRef::Username("watcher".into()), &["main"]),       // fan-in w/ rob
-            route(ChatRef::Id(telegram_relay::config::ChatId(-100)), &["main"]),
-        ];
-        let out = render_routes_ascii(&routes, 2);
-        assert!(out.contains("3 route(s), 2 webhook(s)"));
-        assert!(out.contains("@rob")); // username rendered with @
-        assert!(out.contains("-100")); // numeric id as-is
-        assert!(out.contains("fan-in")); // main has 3 sources
-        assert!(out.contains("fan-out")); // rob has 2 webhooks
-        assert!(out.contains("◀──") && out.contains("──▶"));
+    fn labels(pairs: &[(&str, &str)]) -> HashMap<WebhookName, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (WebhookName(k.to_string()), v.to_string()))
+            .collect()
     }
 
     #[test]
-    fn no_fan_sections_when_all_one_to_one() {
-        let routes = vec![route(ChatRef::Username("a".into()), &["x"])];
-        let out = render_routes_ascii(&routes, 1);
-        assert!(!out.contains("fan-in"));
-        assert!(!out.contains("fan-out"));
+    fn diagram_shows_both_directions_with_friendly_labels() {
+        let routes = vec![
+            route(
+                Some("Alpha"),
+                ChatRef::Username("alpha_news".into()),
+                &["crypto", "hub"],
+            ),
+            route(
+                Some("Beta"),
+                ChatRef::Username("beta_wire".into()),
+                &["news", "hub"],
+            ),
+        ];
+        let lbls = labels(&[
+            ("crypto", "server · #crypto"),
+            ("hub", "HUB"),
+            ("news", "server · #news"),
+        ]);
+        let out = render_routes_ascii(&routes, &lbls);
+        assert!(out.contains("2 source(s) → 3 destination(s)"), "{out}");
+        // both directional views present
+        assert!(out.contains("by source"));
+        assert!(out.contains("by destination"));
+        // friendly source ("Alpha (@alpha_news)") and destination labels render
+        assert!(out.contains("Alpha (@alpha_news)"), "{out}");
+        assert!(out.contains("server · #crypto"));
+        assert!(out.contains("HUB"));
+        // both arrows
+        assert!(out.contains("──▶") && out.contains("◀──"));
+        // the shared hub takes both sources -> flagged as the firehose
+        assert!(out.contains("(all sources)"), "{out}");
+    }
+
+    #[test]
+    fn diagram_falls_back_to_handle_when_unlabeled() {
+        let routes = vec![
+            route(None, ChatRef::Username("chan_a".into()), &["main"]),
+            route(None, ChatRef::Id(ChatId(-100)), &["main"]),
+        ];
+        // no webhook label -> the raw key "main" is used as the destination name
+        let out = render_routes_ascii(&routes, &labels(&[("main", "main")]));
+        assert!(out.contains("@chan_a")); // username rendered with @
+        assert!(out.contains("-100")); // numeric id as-is
+        assert!(out.contains("(all sources)")); // both feed the one destination
     }
 }
 
@@ -304,56 +349,94 @@ fn source_label(from: &telegram_relay::config::ChatRef) -> String {
     }
 }
 
-/// Draw the routing table as an ASCII diagram: each source and the webhooks it
-/// feeds, plus explicit fan-in (many sources → one webhook) and fan-out (one
-/// source → many webhooks) sections so the "profile" shape is obvious. Pure so
-/// it can be unit-tested; `routes_cmd` just prints it.
+/// Draw the routing table two ways so the wiring is unambiguous:
+///   * **by source** — every telegram channel and where it fans out to
+///   * **by destination** — every discord channel and which sources fan into it
+///
+/// Both use friendly names when the config sets them (a route `label` like
+/// "Rob", a webhook `label` like "lock-in · #crypto"), falling back to the raw
+/// `@handle` / webhook key. Pure so it can be unit-tested; `routes_cmd` prints
+/// it. Never receives a URL — only labels — so it is safe to log.
 fn render_routes_ascii(
     routes: &[telegram_relay::config::RouteCfg],
-    webhook_count: usize,
+    webhook_labels: &std::collections::HashMap<telegram_relay::config::WebhookName, String>,
 ) -> String {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
+    use telegram_relay::config::WebhookName;
+
+    // A webhook's friendly destination name: its `label`, else the config key.
+    let hook_label = |w: &WebhookName| -> String {
+        webhook_labels
+            .get(w)
+            .cloned()
+            .unwrap_or_else(|| w.0.clone())
+    };
+    // Short source name for the inverse view: route `label` ("Rob"), else @handle.
+    let src_short = |r: &telegram_relay::config::RouteCfg| {
+        r.label.clone().unwrap_or_else(|| source_label(&r.from))
+    };
+    // Long source name for the forward view: "News (@some_channel)" when labeled.
+    let src_long = |r: &telegram_relay::config::RouteCfg| match &r.label {
+        Some(l) => format!("{l} ({})", source_label(&r.from)),
+        None => source_label(&r.from),
+    };
+
+    // Distinct source channels — two routes on one @handle count once.
+    let distinct_sources: BTreeSet<String> = routes.iter().map(|r| source_label(&r.from)).collect();
+
+    // by destination is keyed by the UNIQUE webhook key (w.0), never the display
+    // label — two webhooks that happen to share a label must not collapse into
+    // one row. Value = (display label, the distinct sources feeding it).
+    let mut by_hook: BTreeMap<&str, (String, BTreeSet<String>)> = BTreeMap::new();
+    for r in routes {
+        for w in &r.to {
+            let entry = by_hook
+                .entry(w.0.as_str())
+                .or_insert_with(|| (hook_label(w), BTreeSet::new()));
+            entry.1.insert(src_short(r));
+        }
+    }
+
     let mut out = String::new();
     out.push_str(&format!(
-        "telegram-relay — routing ({} route(s), {webhook_count} webhook(s))\n\n",
-        routes.len(),
+        "telegram-relay — routing ({} source(s) → {} destination(s))\n\n",
+        distinct_sources.len(),
+        by_hook.len(),
     ));
 
-    // source → webhooks (in config order), and the inverse for fan-in.
-    let width = routes
+    // ---- by source: each telegram channel and where it goes (fan-out) ----
+    out.push_str("by source — where each telegram channel goes:\n");
+    let swidth = routes
         .iter()
-        .map(|r| source_label(&r.from).chars().count())
+        .map(|r| src_long(r).chars().count())
         .max()
         .unwrap_or(0);
-    let mut by_webhook: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for r in routes {
-        let src = source_label(&r.from);
-        let hooks: Vec<&str> = r.to.iter().map(|w| w.0.as_str()).collect();
-        out.push_str(&format!("  {src:<width$}  ──▶  {}\n", hooks.join(", ")));
-        for h in hooks {
-            by_webhook.entry(h).or_default().push(src.clone());
-        }
+        let dests: Vec<String> = r.to.iter().map(&hook_label).collect();
+        out.push_str(&format!(
+            "  {:<swidth$}  ──▶  {}\n",
+            src_long(r),
+            dests.join(" · ")
+        ));
     }
 
-    let fan_in: Vec<_> = by_webhook.iter().filter(|(_, s)| s.len() > 1).collect();
-    if !fan_in.is_empty() {
-        out.push_str("\nfan-in (many sources → one webhook):\n");
-        for (hook, srcs) in fan_in {
-            out.push_str(&format!("  {hook}  ◀──  {}\n", srcs.join(", ")));
-        }
-    }
-
-    let fan_out: Vec<_> = routes.iter().filter(|r| r.to.len() > 1).collect();
-    if !fan_out.is_empty() {
-        out.push_str("\nfan-out (one source → many webhooks):\n");
-        for r in fan_out {
-            let hooks: Vec<&str> = r.to.iter().map(|w| w.0.as_str()).collect();
-            out.push_str(&format!(
-                "  {}  ──▶  {}\n",
-                source_label(&r.from),
-                hooks.join(", ")
-            ));
-        }
+    // ---- by destination: each discord channel and who feeds it (fan-in) ----
+    out.push_str("\nby destination — what each discord channel receives:\n");
+    let dwidth = by_hook
+        .values()
+        .map(|(lbl, _)| lbl.chars().count())
+        .max()
+        .unwrap_or(0);
+    let total_src = distinct_sources.len();
+    for (lbl, srcs) in by_hook.values() {
+        // Flag a channel that takes the whole firehose — every distinct source.
+        let note = if srcs.len() > 1 && srcs.len() == total_src {
+            "   (all sources)"
+        } else {
+            ""
+        };
+        let joined = srcs.iter().cloned().collect::<Vec<_>>().join(" · ");
+        out.push_str(&format!("  {lbl:<dwidth$}  ◀──  {joined}{note}\n"));
     }
     out
 }
@@ -361,7 +444,7 @@ fn render_routes_ascii(
 /// `routes` verb: print the wiring diagram from config alone (no session).
 fn routes_cmd(config_path: &Path) -> anyhow::Result<()> {
     let cfg = Config::load(config_path).context("loading config")?;
-    print!("{}", render_routes_ascii(&cfg.routes, cfg.webhooks.len()));
+    print!("{}", render_routes_ascii(&cfg.routes, &cfg.webhook_labels));
     Ok(())
 }
 
@@ -582,7 +665,7 @@ async fn backfill(
                 if media.size().unwrap_or(0) as u64 > cfg.media.max_bytes {
                     continue; // oversized: falls back to a deep-link notice below
                 }
-                match download_media(&conn.client, &media).await {
+                match download_media(&conn.client, &media, cfg.media.max_bytes).await {
                     Ok(bytes) => files.push((media_filename(&media, m.id()), bytes)),
                     Err(e) => {
                         warn!(error = %e, msg_id = m.id(), "backfill: media download failed")
@@ -820,6 +903,22 @@ impl Ops {
     }
 }
 
+/// True when a Telegram RPC error means our session is no longer valid — a
+/// remote logout, ban, or deactivation. Unlike a transient network error,
+/// restarting won't fix it (re-login required), so the relay must alert and stop
+/// rather than loop uselessly.
+fn is_auth_error(e: &grammers_client::InvocationError) -> bool {
+    matches!(
+        e,
+        grammers_client::InvocationError::Rpc(rpc)
+            if rpc.code == 401
+                || rpc.name.contains("AUTH_KEY_UNREGISTERED")
+                || rpc.name.contains("SESSION_REVOKED")
+                || rpc.name.contains("USER_DEACTIVATED")
+                || rpc.name.contains("AUTH_KEY_DUPLICATED")
+    )
+}
+
 async fn run(config_path: &Path) -> anyhow::Result<()> {
     let (api_id, _api_hash) = api_credentials()?;
     let cfg = Config::load(config_path).context("loading config")?;
@@ -830,7 +929,7 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
     // Telegram must connect BEFORE the store opens: grammers-session (libsql)
     // calls sqlite3_config(), which fails with SQLITE_MISUSE if rusqlite has
     // already initialized the linked-in SQLite. Order is load-bearing.
-    let conn = telegram::connect(api_id, Path::new(SESSION_FILE)).await?;
+    let mut conn = telegram::connect(api_id, Path::new(SESSION_FILE)).await?;
 
     let store = Arc::new(Store::open(&cfg.store.path).context("opening message store")?);
     info!("message store at {}", cfg.store.path.display());
@@ -841,9 +940,17 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
         return Err(anyhow!("not authorized; run `telegram-relay login` first"));
     }
 
-    // Initial route resolution — fatal if it fails (nothing to route).
+    // Initial route resolution — fatal only if EVERY route fails (nothing to
+    // route). A partial failure skips the bad routes and relays the rest.
     let resolved = match telegram::resolve_routes(&conn.client, &cfg).await {
-        Ok(r) => r,
+        Ok(r) => {
+            for f in &r.failures {
+                warn!("skipping unresolved {f}");
+                ops.notice(&format!("route skipped (unresolved): {f}"))
+                    .await;
+            }
+            r
+        }
         Err(e) => {
             ops.notice(&format!("startup route resolution failed: {e}"))
                 .await;
@@ -909,12 +1016,21 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
     // Downloads run on spawned tasks and hand finished items back to the loop
     // over this channel; `album` stays single-owned by the loop.
     let (media_tx, mut media_rx) = mpsc::channel::<MediaItem>(MEDIA_CHANNEL_CAP);
+    // Bounds concurrent media downloads so a burst can't OOM the host.
+    let download_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
 
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut media_tick = tokio::time::interval(MEDIA_TICK);
     let mut reload_tick = tokio::time::interval(RELOAD_TICK);
     let mut last_mtime = file_mtime(config_path);
+    let mut liveness_tick = tokio::time::interval(LIVENESS_PROBE);
+    liveness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // When an update last arrived, so the liveness probe fires only during
+    // silence; and consecutive probe failures, so a transient blip is tolerated
+    // but a sustained outage escalates to a restart.
+    let mut last_update = Instant::now();
+    let mut probe_failures: u32 = 0;
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("installing SIGTERM handler")?;
@@ -931,15 +1047,63 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
             _ = tokio::signal::ctrl_c() => { info!("SIGINT received"); break; }
             _ = sigterm.recv() => { info!("SIGTERM received"); break; }
 
+            // The sender pool's runner exited (e.g. a panic in a per-connection
+            // sender). The update stream is now dead and would hot-spin returning
+            // Err forever with the process still "up" — so systemd's restart would
+            // never fire. Alert and exit non-zero instead: systemd restarts us and
+            // catch_up recovers the gap. This is the "never silently dead" guard.
+            res = &mut conn.pool_task => {
+                error!(result = ?res, "telegram sender pool exited");
+                ops.notice("telegram sender pool exited — restarting").await;
+                return Err(anyhow!("telegram sender pool exited"));
+            }
+
             update = updates.next() => {
                 match update {
                     Ok(u) => {
+                        last_update = Instant::now();
+                        probe_failures = 0;
                         handle_update(
                             u, &conn.client, &live, &deliverer, &ops, &store,
-                            &mut dedup, &media_tx,
+                            &mut dedup, &media_tx, &download_sem,
                         ).await;
                     }
-                    Err(e) => warn!(error = %e, "update stream error"),
+                    // Back off briefly so a repeated stream error can't hot-spin
+                    // the loop (the pool-exit arm above handles a truly dead pool).
+                    Err(e) => {
+                        warn!(error = %e, "update stream error");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+
+            // Active liveness + deauth probe, only after LIVENESS_PROBE of silence
+            // (a busy relay is self-evidently alive). A revoked session is fatal —
+            // re-login required — so alert and exit. A transient failure is
+            // tolerated (the invoke also forces a reconnect); only sustained
+            // failure escalates to a restart.
+            _ = liveness_tick.tick() => {
+                if last_update.elapsed() >= LIVENESS_PROBE {
+                    match conn.client.get_me().await {
+                        Ok(_) => { probe_failures = 0; }
+                        Err(e) if is_auth_error(&e) => {
+                            error!(error = %e, "telegram session deauthorized");
+                            ops.notice(
+                                "telegram session deauthorized — relay stopped; re-login required",
+                            ).await;
+                            return Err(anyhow!("session deauthorized: {e}"));
+                        }
+                        Err(e) => {
+                            probe_failures += 1;
+                            warn!(error = %e, probe_failures, "telegram liveness probe failed");
+                            if probe_failures >= 3 {
+                                ops.notice("telegram connection unrecoverable — restarting").await;
+                                return Err(anyhow!(
+                                    "telegram liveness lost after {probe_failures} probes"
+                                ));
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1009,8 +1173,14 @@ async fn reload(config_path: &Path, client: &Client, live: &ArcSwap<Live>, ops: 
     };
     match telegram::resolve_routes(client, &cfg).await {
         Ok(res) => {
+            for f in &res.failures {
+                warn!("reload skipping unresolved {f}");
+                ops.notice(&format!("route skipped on reload (unresolved): {f}"))
+                    .await;
+            }
+            let active = res.routes.len();
             live.store(Arc::new(Live::build(res.routes, &cfg)));
-            info!("config reloaded; {} route(s)", cfg.routes.len());
+            info!("config reloaded; {active} route(s) active");
         }
         Err(e) => {
             warn!(error = %e, "config reload: route resolution failed; keeping previous");
@@ -1031,6 +1201,7 @@ async fn handle_update(
     store: &Arc<Store>,
     dedup: &mut Dedup,
     media_tx: &mpsc::Sender<MediaItem>,
+    download_sem: &Arc<tokio::sync::Semaphore>,
 ) {
     let Some(incoming) = telegram::classify(update) else {
         return;
@@ -1061,6 +1232,11 @@ async fn handle_update(
             date,
             ..
         } => {
+            // Dedup destinations across routes: if two routes on this chat list
+            // the same webhook, the text posts there ONCE. Without this the PK
+            // (chat, msg, discord_id) admits two rows and the refresh worker
+            // maintains both duplicates forever (the media path already dedups).
+            let mut seen: HashSet<String> = HashSet::new();
             for route in routes {
                 if let Some(f) = &route.filter {
                     if !passes_filter(&body, f) {
@@ -1089,6 +1265,9 @@ async fn handle_update(
                 let embeds = render::embed(&text, &meta);
                 let hash = content_hash(&body);
                 for (name, url) in resolve_targets_named(route, &snapshot.webhooks) {
+                    if !seen.insert(name.0.clone()) {
+                        continue; // already delivered to this webhook this message
+                    }
                     spawn_embed(
                         deliverer.clone(),
                         ops.clone(),
@@ -1170,8 +1349,14 @@ async fn handle_update(
                 let client = client.clone();
                 let media_tx = media_tx.clone();
                 let ops = ops.clone();
+                let max_bytes = snapshot.media.max_bytes;
+                let sem = download_sem.clone();
                 tokio::spawn(async move {
-                    let bytes = match download_media(&client, &media).await {
+                    // Gate concurrent downloads: each buffers a whole file in RAM,
+                    // so without this a burst (or a catch-up backlog) of media
+                    // could OOM the host. Peak media memory ~= permits * max_bytes.
+                    let _permit = sem.acquire_owned().await;
+                    let bytes = match download_media(&client, &media, max_bytes).await {
                         Ok(b) => b,
                         Err(e) => {
                             warn!(error = %e, msg_id, "media download failed");
@@ -1668,11 +1853,20 @@ fn relay_latency_ms(discord_msg_id: &str, telegram_date_rfc3339: &str) -> Option
 }
 
 /// Download a media file fully into memory via the chunked download iterator.
-async fn download_media(client: &Client, media: &Media) -> anyhow::Result<Vec<u8>> {
+async fn download_media(client: &Client, media: &Media, max_bytes: u64) -> anyhow::Result<Vec<u8>> {
     let mut download = client.iter_download(media);
     let mut bytes = Vec::new();
     while let Some(chunk) = download.next().await? {
         bytes.extend_from_slice(&chunk);
+        // Enforce the ceiling on ACTUAL bytes, not the declared size(): a media
+        // whose size() is None reads as 0 and would otherwise download without
+        // bound. Abort early so one file can't exhaust memory.
+        if bytes.len() as u64 > max_bytes {
+            anyhow::bail!(
+                "media exceeded max_bytes ({} > {max_bytes}) mid-download",
+                bytes.len()
+            );
+        }
     }
     Ok(bytes)
 }

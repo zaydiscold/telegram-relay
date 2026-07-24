@@ -31,6 +31,9 @@ pub struct Filter {
 #[derive(Debug, Clone)]
 pub struct RouteCfg {
     pub name: String,
+    /// Optional human-friendly source name shown in `routes` (e.g. "News" for
+    /// `@some_channel`). Falls back to the raw `@handle` / chat id when unset.
+    pub label: Option<String>,
     pub from: ChatRef,
     pub to: Vec<WebhookName>,
     pub filter: Option<Filter>,
@@ -134,6 +137,11 @@ impl Default for StoreCfg {
 pub struct Config {
     pub routes: Vec<RouteCfg>,
     pub webhooks: HashMap<WebhookName, WebhookUrl>,
+    /// Human-friendly destination name per webhook (e.g. "lock-in · #crypto"),
+    /// shown in `routes`. Every webhook has an entry — it defaults to the
+    /// webhook's config key when no `label` is given. Never holds a URL, so it
+    /// is safe to print.
+    pub webhook_labels: HashMap<WebhookName, String>,
     pub ops_webhook: Option<WebhookUrl>,
     pub media: MediaCfg,
     pub refresh: RefreshCfg,
@@ -214,6 +222,8 @@ mod raw {
     #[derive(Deserialize)]
     pub struct Route {
         pub name: String,
+        #[serde(default)]
+        pub label: Option<String>, // friendly source name, e.g. "Rob"
         pub from: serde_yaml::Value, // "@name" | "name" | -100123
         pub to: Vec<String>,
         pub filter: Option<Filter>,
@@ -232,6 +242,8 @@ mod raw {
     #[derive(Deserialize)]
     pub struct EnvRef {
         pub env: String,
+        #[serde(default)]
+        pub label: Option<String>, // friendly destination, e.g. "lock-in · #crypto"
     }
     #[derive(Deserialize)]
     pub struct Media {
@@ -249,12 +261,16 @@ impl Config {
         let raw: raw::Root = serde_yaml::from_str(&text)?;
 
         let mut webhooks = HashMap::new();
+        let mut webhook_labels = HashMap::new();
         for (name, r) in raw.webhooks {
             let url = std::env::var(&r.env).map_err(|_| ConfigError::MissingEnv {
                 name: name.clone(),
                 env: r.env.clone(),
             })?;
-            webhooks.insert(WebhookName(name), WebhookUrl(url));
+            let label = r.label.unwrap_or_else(|| name.clone());
+            let wname = WebhookName(name);
+            webhook_labels.insert(wname.clone(), label);
+            webhooks.insert(wname, WebhookUrl(url));
         }
         let ops_webhook = match raw.ops_webhook {
             None => None,
@@ -271,7 +287,13 @@ impl Config {
             if r.to.is_empty() {
                 return Err(ConfigError::EmptyTo { route: r.name });
             }
-            let to: Vec<WebhookName> = r.to.into_iter().map(WebhookName).collect();
+            let mut to: Vec<WebhookName> = r.to.into_iter().map(WebhookName).collect();
+            // Dedup a route's own destination list so `to: [ttk, ttk]` (or an
+            // accidental repeat) delivers once, not twice, to the same webhook.
+            {
+                let mut seen = std::collections::HashSet::new();
+                to.retain(|w| seen.insert(w.0.clone()));
+            }
             for h in &to {
                 if !webhooks.contains_key(h) {
                     return Err(ConfigError::UnknownWebhook {
@@ -324,6 +346,7 @@ impl Config {
             };
             routes.push(RouteCfg {
                 name: r.name,
+                label: r.label,
                 from,
                 to,
                 filter: r.filter.map(|f| Filter {
@@ -354,6 +377,7 @@ impl Config {
         Ok(Config {
             routes,
             webhooks,
+            webhook_labels,
             ops_webhook,
             media: MediaCfg {
                 mode,

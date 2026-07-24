@@ -22,7 +22,7 @@ use grammers_client::{Client, SenderPool, SignInError};
 use grammers_session::storages::SqliteSession;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinHandle;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::{ChatId, ChatRef, Config};
 use crate::router::ResolvedRoute;
@@ -144,6 +144,11 @@ pub struct Resolution {
     /// for `ChatRef::Username` routes (where a full [`Peer`] is resolved);
     /// numeric-id routes have no entry and leave the webhook identity untouched.
     pub identities: HashMap<ChatId, ChannelIdentity>,
+    /// Routes that could not be resolved (typo, deleted channel, transient
+    /// error), as `"route 'name': <reason>"`. These are SKIPPED, not fatal — one
+    /// bad source must not stop the others — so the caller surfaces them (an ops
+    /// notice) but keeps relaying whatever resolved.
+    pub failures: Vec<String>,
 }
 
 /// A source channel's display identity, for mirroring onto the Discord webhook.
@@ -198,35 +203,56 @@ pub async fn fetch_chat_photo(
 /// captured for refresh); `ChatRef::Id` is used as-is (no `PeerRef`, so numeric
 /// routes are not refreshable — they still relay live). Logs
 /// `route '{name}' watching '{title}' ({id})` per route.
+/// Resolve one `@username` route to `(chat id, title)`, recording its peer ref
+/// and channel identity as side effects. Fallible so [`resolve_routes`] can skip
+/// a route that won't resolve instead of aborting all of them.
+async fn resolve_username_route(
+    client: &Client,
+    username: &str,
+    peers: &mut HashMap<ChatId, grammers_client::session::types::PeerRef>,
+    identities: &mut HashMap<ChatId, ChannelIdentity>,
+) -> anyhow::Result<(ChatId, String)> {
+    let peer = client
+        .resolve_username(username)
+        .await
+        .with_context(|| format!("resolving @{username}"))?
+        .ok_or_else(|| anyhow!("username '@{username}' not found"))?;
+    let id = peer.id().bot_api_dialog_id_unchecked();
+    let title = peer.name().unwrap_or(username).to_string();
+    if let Ok(Some(pref)) = peer.to_ref().await {
+        peers.insert(ChatId(id), pref);
+    }
+    // Capture the channel's display identity for the webhook avatar (best-effort;
+    // a missing/failed photo just yields `None`).
+    if let std::collections::hash_map::Entry::Vacant(e) = identities.entry(ChatId(id)) {
+        let photo = fetch_chat_photo(client, &peer).await;
+        e.insert(ChannelIdentity {
+            title: title.clone(),
+            photo,
+        });
+    }
+    Ok((ChatId(id), title))
+}
+
 pub async fn resolve_routes(client: &Client, cfg: &Config) -> anyhow::Result<Resolution> {
     let mut resolved = Vec::with_capacity(cfg.routes.len());
     let mut peers = HashMap::new();
     let mut identities: HashMap<ChatId, ChannelIdentity> = HashMap::new();
+    let mut failures: Vec<String> = Vec::new();
     for route in &cfg.routes {
         let (chat, title) = match &route.from {
             ChatRef::Username(username) => {
-                let peer = client
-                    .resolve_username(username)
-                    .await
-                    .with_context(|| format!("resolving @{username}"))?
-                    .ok_or_else(|| {
-                        anyhow!("route '{}': username '@{username}' not found", route.name)
-                    })?;
-                let id = peer.id().bot_api_dialog_id_unchecked();
-                let title = peer.name().unwrap_or(username).to_string();
-                if let Ok(Some(pref)) = peer.to_ref().await {
-                    peers.insert(ChatId(id), pref);
+                match resolve_username_route(client, username, &mut peers, &mut identities).await {
+                    Ok(ct) => ct,
+                    Err(e) => {
+                        // Skip a route that won't resolve (typo, deleted channel,
+                        // transient error) rather than aborting EVERY route — one
+                        // bad source must not crash-loop the whole relay.
+                        warn!(route = %route.name, "route resolution failed: {e:#}");
+                        failures.push(format!("route '{}': {e}", route.name));
+                        continue;
+                    }
                 }
-                // Capture the channel's display identity for the webhook avatar
-                // (best-effort; a missing/failed photo just yields `None`).
-                if let std::collections::hash_map::Entry::Vacant(e) = identities.entry(ChatId(id)) {
-                    let photo = fetch_chat_photo(client, &peer).await;
-                    e.insert(ChannelIdentity {
-                        title: title.clone(),
-                        photo,
-                    });
-                }
-                (ChatId(id), title)
             }
             ChatRef::Id(id) => (*id, format!("id:{}", id.0)),
         };
@@ -240,10 +266,19 @@ pub async fn resolve_routes(client: &Client, cfg: &Config) -> anyhow::Result<Res
             media_mode: route.media_mode,
         });
     }
+    // Only fatal if NOTHING resolved (a config with routes that all failed);
+    // a partial success keeps relaying the routes that worked.
+    if resolved.is_empty() && !cfg.routes.is_empty() {
+        anyhow::bail!(
+            "no routes resolved: all {} route(s) failed",
+            cfg.routes.len()
+        );
+    }
     Ok(Resolution {
         routes: resolved,
         peers,
         identities,
+        failures,
     })
 }
 
@@ -627,9 +662,10 @@ pub fn classify(update: Update) -> Option<Incoming> {
             date,
         }),
         Routing::File => {
-            let media = message
-                .media()
-                .expect("File routing implies message.media() is Some");
+            // Classify runs on the main loop task, so a panic here would crash
+            // the daemon and (with catch_up replaying the message) crash-loop it.
+            // Treat an unexpectedly media-less File routing as "nothing to relay".
+            let media = message.media()?;
             let approx_size = media.size().unwrap_or(0) as u64;
             Some(Incoming::Media {
                 chat,

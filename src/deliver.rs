@@ -100,23 +100,28 @@ impl Deliverer {
     ///
     /// `PATCH {webhook}/messages/{discord_msg_id}` with a new `embeds` array.
     ///
-    /// `attachments: []` clears any standalone attachment. Media posts inline
-    /// their image via the embed's CDN url, but the original uploaded file stays
-    /// on the message; once the embed references it by CDN url instead of
-    /// `attachment://`, Discord un-consumes it and would render it a SECOND time
-    /// (a standalone image leaking above the embed). Clearing attachments here
-    /// leaves only the single inline embed image. Harmless no-op for text posts.
+    /// `keep_attachments` is the `(id, filename)` of every image the message
+    /// should retain. On an edit, Discord DELETES any existing attachment not
+    /// listed in the `attachments` array — so an empty array wipes the media
+    /// post's image (its embed url then 404s and the post goes blank). Listing
+    /// the existing attachment by id keeps the file; the embed references it via
+    /// `attachment://filename`. Text posts pass an empty slice.
     pub async fn patch_embed(
         &self,
         url: &WebhookUrl,
         discord_msg_id: &str,
         embeds: serde_json::Value,
+        keep_attachments: &[(String, String)],
     ) -> Outcome {
         let target = format!("{}/messages/{discord_msg_id}", url.0);
+        let attachments: Vec<serde_json::Value> = keep_attachments
+            .iter()
+            .map(|(id, filename)| serde_json::json!({ "id": id, "filename": filename }))
+            .collect();
         let body = serde_json::json!({
             "embeds": embeds,
             "allowed_mentions": { "parse": [] },
-            "attachments": [],
+            "attachments": attachments,
         });
         let resp = self.http.patch(&target).json(&body).send().await;
         match resp {
@@ -345,36 +350,88 @@ impl Deliverer {
             "attachments": attachment_meta,
         })
         .to_string();
-        // multipart Form is not clonable, so it is built fresh here (single
-        // attempt); the bytes are owned so a retry loop could rebuild it later.
-        let mut form = reqwest::multipart::Form::new().text("payload_json", payload);
-        for (i, (filename, bytes)) in files.into_iter().enumerate() {
-            let part = reqwest::multipart::Part::bytes(bytes).file_name(filename);
-            form = form.part(format!("files[{i}]"), part);
-        }
-        match self.http.post(&target).multipart(form).send().await {
-            Ok(r) if r.status().is_success() => {
-                let text = r.text().await.unwrap_or_default();
-                match parse_message_id(&text) {
-                    Some(id) => PostResult::Delivered {
-                        discord_msg_id: id,
-                        image_urls: parse_embed_image_urls(&text),
-                    },
-                    None => PostResult::Dropped {
-                        reason: format!("no message id in media response: {text}"),
-                    },
+        // multipart Form is not clonable, so rebuild it from the owned bytes on
+        // each attempt. Media deserves the same resilience as text posts: a
+        // single transient 429/5xx must not silently drop a whole album (the old
+        // single-attempt path was how media went missing under load).
+        let build_form = || {
+            let mut form = reqwest::multipart::Form::new().text("payload_json", payload.clone());
+            for (i, (filename, bytes)) in files.iter().enumerate() {
+                let part =
+                    reqwest::multipart::Part::bytes(bytes.clone()).file_name(filename.clone());
+                form = form.part(format!("files[{i}]"), part);
+            }
+            form
+        };
+        let backoffs = [
+            Duration::from_millis(250),
+            Duration::from_secs(1),
+            Duration::from_secs(4),
+        ];
+        let mut attempt = 0;
+        let mut rate_limit_attempts = 0;
+        let mut rate_limit_cumulative_wait = 0.0;
+        loop {
+            match self.http.post(&target).multipart(build_form()).send().await {
+                Ok(r) if r.status().is_success() => {
+                    let text = r.text().await.unwrap_or_default();
+                    return match parse_message_id(&text) {
+                        Some(id) => PostResult::Delivered {
+                            discord_msg_id: id,
+                            image_urls: parse_delivered_media_urls(&text),
+                        },
+                        None => PostResult::Dropped {
+                            reason: format!("no message id in media response: {text}"),
+                        },
+                    };
+                }
+                Ok(r) if r.status().as_u16() == 429 => {
+                    rate_limit_attempts += 1;
+                    if rate_limit_attempts >= MAX_429_ATTEMPTS {
+                        return PostResult::Dropped {
+                            reason: format!(
+                                "media rate limited beyond {MAX_429_ATTEMPTS} attempts"
+                            ),
+                        };
+                    }
+                    let wait = retry_after_secs(&r).unwrap_or(1.0);
+                    if rate_limit_cumulative_wait + wait > RATE_LIMIT_BUDGET_SECS {
+                        return PostResult::Dropped {
+                            reason: format!(
+                                "media rate limited beyond {RATE_LIMIT_BUDGET_SECS:.1}s budget"
+                            ),
+                        };
+                    }
+                    warn!(wait, "discord 429 on media; honoring retry_after");
+                    rate_limit_cumulative_wait += wait;
+                    tokio::time::sleep(Duration::from_secs_f64(wait)).await;
+                }
+                Ok(r) if r.status().is_server_error() => {
+                    if attempt >= backoffs.len() {
+                        return PostResult::Dropped {
+                            reason: format!("media 5xx after retries: {}", r.status()),
+                        };
+                    }
+                    tokio::time::sleep(backoffs[attempt]).await;
+                    attempt += 1;
+                }
+                Ok(r) => {
+                    let status = r.status();
+                    let text = r.text().await.unwrap_or_default();
+                    return PostResult::Dropped {
+                        reason: format!("media upload failed: {status}: {text}"),
+                    };
+                }
+                Err(e) => {
+                    if attempt >= backoffs.len() {
+                        return PostResult::Dropped {
+                            reason: format!("media upload network: {}", e.without_url()),
+                        };
+                    }
+                    tokio::time::sleep(backoffs[attempt]).await;
+                    attempt += 1;
                 }
             }
-            Ok(r) => {
-                let status = r.status();
-                let text = r.text().await.unwrap_or_default();
-                PostResult::Dropped {
-                    reason: format!("media upload failed: {status}: {text}"),
-                }
-            }
-            Err(e) => PostResult::Dropped {
-                reason: format!("media upload network: {}", e.without_url()),
-            },
         }
     }
 }
@@ -388,25 +445,49 @@ fn parse_message_id(text: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Parse the resolved image CDN URLs from a Discord message response.
+/// Parse the resolved CDN URLs of every piece of media attached to a Discord
+/// message response, so a later refresh PATCH can keep them instead of deleting
+/// the files.
 ///
-/// When an embed references an uploaded image via `attachment://`, Discord
-/// resolves it, moves the final `cdn.discordapp.com` URL into the embed's
-/// `image.url`, and empties the top-level `attachments` array. So the durable
-/// URL to reuse on a later PATCH lives at `embeds[].image.url`, not in
-/// `attachments`. These are Discord's own hosted copies — reusing them keeps the
-/// image inline on refresh without re-uploading (or re-downloading from Telegram).
-fn parse_embed_image_urls(text: &str) -> Vec<String> {
+/// Two places to look, because Discord splits media by type:
+///   * **images** referenced via `attachment://` are consumed into the embed —
+///     Discord moves the `cdn.discordapp.com` URL into `embeds[].image.url` and
+///     empties the top-level `attachments`.
+///   * **video / audio / documents** can't render in an embed, so they stay in
+///     the top-level `attachments[].url`.
+///
+/// Both are needed: capturing only the embed images (the old behavior) meant a
+/// video post stored an empty list, so the first refresh PATCH sent
+/// `attachments: []` and Discord deleted the video — the post went blank. The
+/// returned URLs carry Discord's `(attachment_id, filename)`, which the refresh
+/// path re-attaches by id (see `refresh::reattach_stored_media`). Order-preserving
+/// dedup guards the theoretical case of a URL appearing in both places.
+fn parse_delivered_media_urls(text: &str) -> Vec<String> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
         return Vec::new();
     };
-    let Some(embeds) = v.get("embeds").and_then(|e| e.as_array()) else {
-        return Vec::new();
-    };
-    embeds
-        .iter()
-        .filter_map(|e| e.get("image")?.get("url")?.as_str().map(String::from))
-        .collect()
+    let mut urls: Vec<String> = Vec::new();
+    if let Some(embeds) = v.get("embeds").and_then(|e| e.as_array()) {
+        for e in embeds {
+            if let Some(u) = e
+                .get("image")
+                .and_then(|i| i.get("url"))
+                .and_then(|u| u.as_str())
+            {
+                urls.push(u.to_string());
+            }
+        }
+    }
+    if let Some(atts) = v.get("attachments").and_then(|a| a.as_array()) {
+        for a in atts {
+            if let Some(u) = a.get("url").and_then(|u| u.as_str()) {
+                urls.push(u.to_string());
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    urls.retain(|u| seen.insert(u.clone()));
+    urls
 }
 
 fn retry_after_secs(r: &reqwest::Response) -> Option<f64> {
@@ -418,7 +499,7 @@ fn retry_after_secs(r: &reqwest::Response) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_embed_image_urls, parse_message_id};
+    use super::{parse_delivered_media_urls, parse_message_id};
 
     #[test]
     fn extracts_cdn_image_url_from_embed() {
@@ -429,14 +510,43 @@ mod tests {
              "image":{"url":"https://cdn.discordapp.com/attachments/1/2/photo.jpg"}}]}"#;
         assert_eq!(parse_message_id(resp).as_deref(), Some("999"));
         assert_eq!(
-            parse_embed_image_urls(resp),
+            parse_delivered_media_urls(resp),
             vec!["https://cdn.discordapp.com/attachments/1/2/photo.jpg"]
         );
     }
 
     #[test]
-    fn no_image_embed_yields_empty() {
+    fn captures_non_image_attachment_url() {
+        // A video can't render in an embed, so Discord leaves it in the top-level
+        // attachments[]. It MUST be captured or the first refresh PATCH deletes it.
+        let resp = r#"{"id":"7","attachments":[
+            {"id":"42","filename":"clip.mp4",
+             "url":"https://cdn.discordapp.com/attachments/1/42/clip.mp4"}],"embeds":[]}"#;
+        assert_eq!(
+            parse_delivered_media_urls(resp),
+            vec!["https://cdn.discordapp.com/attachments/1/42/clip.mp4"]
+        );
+    }
+
+    #[test]
+    fn captures_mixed_album_image_and_video_without_dupes() {
+        // Image consumed into the embed + a video left in attachments: both kept,
+        // image first (gallery order), no duplication.
+        let resp = r#"{"id":"8","attachments":[
+            {"id":"2","filename":"v.mp4","url":"https://cdn.discordapp.com/attachments/1/2/v.mp4"}],
+            "embeds":[{"image":{"url":"https://cdn.discordapp.com/attachments/1/1/p.jpg"}}]}"#;
+        assert_eq!(
+            parse_delivered_media_urls(resp),
+            vec![
+                "https://cdn.discordapp.com/attachments/1/1/p.jpg",
+                "https://cdn.discordapp.com/attachments/1/2/v.mp4",
+            ]
+        );
+    }
+
+    #[test]
+    fn no_media_yields_empty() {
         let resp = r#"{"id":"1","embeds":[{"type":"rich","description":"text only"}]}"#;
-        assert!(parse_embed_image_urls(resp).is_empty());
+        assert!(parse_delivered_media_urls(resp).is_empty());
     }
 }
