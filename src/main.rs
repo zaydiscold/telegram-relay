@@ -920,6 +920,25 @@ fn is_auth_error(e: &grammers_client::InvocationError) -> bool {
     )
 }
 
+/// Post a one-line lifecycle notice (boot up / boot down) to EVERY configured
+/// destination webhook, so the relay's start/stop is visible in each channel it
+/// feeds — not just the ops channel. Deduped by URL; best-effort, a failed post
+/// is logged inside `post_text` and never fatal.
+async fn broadcast_lifecycle(
+    deliverer: &Deliverer,
+    webhooks: &HashMap<WebhookName, WebhookUrl>,
+    message: &str,
+) {
+    let mut seen = HashSet::new();
+    for url in webhooks.values() {
+        if seen.insert(url.0.clone()) {
+            let _ = deliverer
+                .post_text(url, "telegram-relay", &[message.to_string()])
+                .await;
+        }
+    }
+}
+
 async fn run(config_path: &Path) -> anyhow::Result<()> {
     let (api_id, _api_hash) = api_credentials()?;
     let cfg = Config::load(config_path).context("loading config")?;
@@ -1038,12 +1057,20 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("installing SIGTERM handler")?;
 
-    // Quiet ops (queued-polish §13): NO routine lifecycle post on start —
-    // those fired on every deploy/restart and were pure noise. Silence is
-    // healthy; the systemd OnFailure watchdog covers "down", and the feed
-    // flowing (plus `stats`) answers "is it up". Only error/drop notices and
-    // route-resolution failures still post. Startup is logged locally only.
+    // Lifecycle notice broadcast to every destination channel (user request):
+    // a boot-up line so silence in a channel is never ambiguous — "no message"
+    // clearly means "no source activity", not "relay dead". The matching
+    // boot-down line posts on graceful shutdown below.
     info!("relay started; watching {} route(s)", cfg.routes.len());
+    broadcast_lifecycle(
+        &deliverer,
+        &cfg.webhooks,
+        &format!(
+            "🟢 telegram-relay online — watching {} channel(s)",
+            cfg.routes.len()
+        ),
+    )
+    .await;
 
     loop {
         tokio::select! {
@@ -1148,9 +1175,11 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
         }
     }
 
-    // Quiet ops (queued-polish §13): no "shutting down" post either — a clean
-    // stop is not an incident. Logged locally only.
     info!("shutting down");
+    // Boot-down notice to every channel (matches the boot-up above), so a
+    // deploy/restart is visible. Only fires on a GRACEFUL stop (SIGTERM/SIGINT);
+    // a crash is covered by the systemd OnFailure watchdog instead.
+    broadcast_lifecycle(&deliverer, &cfg.webhooks, "🔴 telegram-relay shutting down").await;
 
     // Force-flush any albums still inside their quiet window so they are
     // delivered rather than dropped on shutdown.
