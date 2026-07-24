@@ -146,6 +146,10 @@ pub struct Config {
     pub media: MediaCfg,
     pub refresh: RefreshCfg,
     pub store: StoreCfg,
+    /// When true, any Solana/Ethereum contract address found in a message is also
+    /// posted as plain message content (outside the embed) so sniper bots that
+    /// scan message text — e.g. Rickbot — can pick it up. Off by default.
+    pub contract_passthrough: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -187,6 +191,8 @@ mod raw {
         pub refresh: Option<Refresh>,
         #[serde(default)]
         pub store: Option<Store>,
+        #[serde(default)]
+        pub contract_passthrough: bool,
     }
     #[derive(Deserialize)]
     pub struct Refresh {
@@ -385,6 +391,7 @@ impl Config {
             },
             refresh,
             store,
+            contract_passthrough: raw.contract_passthrough,
         })
     }
 }

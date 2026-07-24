@@ -75,12 +75,19 @@ impl Deliverer {
         url: &WebhookUrl,
         username: &str,
         embeds: &serde_json::Value,
+        content: Option<&str>,
     ) -> PostResult {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "embeds": embeds,
             "username": username,
             "allowed_mentions": { "parse": [] },
         });
+        // Plain content outside the embed (e.g. contract addresses) so bots that
+        // scan message text can act on it. `allowed_mentions.parse: []` still
+        // suppresses pings from anything in it.
+        if let Some(c) = content {
+            body["content"] = serde_json::json!(c);
+        }
         let target = format!("{}?wait=true", url.0);
         match self.send_json_capture(&target, &body).await {
             Ok(text) => match parse_message_id(&text) {
@@ -331,6 +338,7 @@ impl Deliverer {
         username: &str,
         embeds: &serde_json::Value,
         files: Vec<(String, Vec<u8>)>,
+        content: Option<&str>,
     ) -> PostResult {
         let target = format!("{}?wait=true", url.0);
         // Discord (v10) only registers uploaded files as attachments if
@@ -343,13 +351,18 @@ impl Deliverer {
             .enumerate()
             .map(|(i, (filename, _))| serde_json::json!({ "id": i, "filename": filename }))
             .collect();
-        let payload = serde_json::json!({
+        let mut payload_val = serde_json::json!({
             "username": username,
             "embeds": embeds,
             "allowed_mentions": { "parse": [] },
             "attachments": attachment_meta,
-        })
-        .to_string();
+        });
+        // Plain content outside the embed (e.g. contract addresses) so scanning
+        // bots can act on it, same as the text path.
+        if let Some(c) = content {
+            payload_val["content"] = serde_json::json!(c);
+        }
+        let payload = payload_val.to_string();
         // multipart Form is not clonable, so rebuild it from the owned bytes on
         // each attempt. Media deserves the same resilience as text posts: a
         // single transient 429/5xx must not silently drop a whole album (the old

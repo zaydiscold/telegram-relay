@@ -44,6 +44,12 @@ media:
   mode: reupload            # reupload | placeholder
   max_bytes: 10000000
 
+# Optional. When true, any Solana / Ethereum contract address found in a message
+# is ALSO posted as plain message content (outside the embed), so sniper/trading
+# bots that scan message text (e.g. Rickbot) can act on it. Off by default; only
+# applies to live relays, never to backfill. Toggling it takes effect on restart.
+contract_passthrough: false
+
 # Optional. Posts are relayed as live-updating Discord embeds; the refresh
 # worker re-checks each post and PATCHes changes. Two cadences run at once:
 #   * edits + deletes  — checked every `interval_mins` for the full

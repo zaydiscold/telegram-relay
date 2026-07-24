@@ -48,6 +48,52 @@ pub fn embed_timestamp(dt: chrono::DateTime<chrono::Utc>) -> String {
     dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+/// Extract Solana / Ethereum contract addresses from a message, first-seen order,
+/// deduped. Used (when `contract_passthrough` is on) to echo them as plain
+/// message CONTENT outside the embed, so sniper bots that scan message text — e.g.
+/// Rickbot — can pick them up (bots read `content`, not embed fields).
+///
+/// Deliberately conservative to avoid false positives: an ETH address is exactly
+/// `0x` + 40 hex; a Solana address is 32-44 base58 chars that mix in at least one
+/// digit AND one uppercase letter (a plain lowercase word or hex run won't match).
+pub fn extract_contract_addresses(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for tok in text.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if (is_eth_address(tok) || is_solana_address(tok)) && seen.insert(tok.to_string()) {
+            out.push(tok.to_string());
+        }
+    }
+    out
+}
+
+/// The plain-content line to post outside the embed for a message's contract
+/// addresses, or `None` when there are none.
+pub fn contract_content(text: &str) -> Option<String> {
+    let cas = extract_contract_addresses(text);
+    (!cas.is_empty()).then(|| cas.join(" "))
+}
+
+fn is_eth_address(t: &str) -> bool {
+    t.len() == 42 && t.starts_with("0x") && t[2..].bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn is_solana_address(t: &str) -> bool {
+    if !(32..=44).contains(&t.len()) {
+        return false;
+    }
+    let (mut has_digit, mut has_upper) = (false, false);
+    for c in t.chars() {
+        // base58 alphabet: alphanumeric minus 0, O, I, l.
+        if !c.is_ascii_alphanumeric() || matches!(c, '0' | 'O' | 'I' | 'l') {
+            return false;
+        }
+        has_digit |= c.is_ascii_digit();
+        has_upper |= c.is_ascii_uppercase();
+    }
+    has_digit && has_upper
+}
+
 /// Image extensions Discord can render *inside* an embed via `attachment://`.
 /// Video and documents can't be embedded — Discord attaches them below.
 pub fn is_image_filename(name: &str) -> bool {
@@ -408,6 +454,30 @@ fn split_chunks(s: &str, limit: usize) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::config::Filter;
+
+    #[test]
+    fn extracts_eth_and_solana_addresses() {
+        let eth = "0x1234567890abcdefABCDEF1234567890abcdef12"; // 0x + 40 hex
+        let sol = "7EqQdEULxWcraVx3mXKFjc84LhCkMGZCkRuDpvcMwJeK"; // 43 base58, mixed
+        let text = format!("buy now: {eth} and mint {sol} 🚀");
+        assert_eq!(extract_contract_addresses(&text), vec![eth, sol]);
+        assert_eq!(
+            contract_content(&text).as_deref(),
+            Some(&*format!("{eth} {sol}"))
+        );
+    }
+
+    #[test]
+    fn contract_detection_rejects_non_addresses_and_dedupes() {
+        // Plain prose, a short hex, and a lowercase-only long token must not match.
+        let none = "gm gm the quick brown fox jumps 0xdeadbeef abcdefghijklmnopqrstuvwxyzabcdef";
+        assert!(extract_contract_addresses(none).is_empty());
+        assert!(contract_content(none).is_none());
+        // The same address twice yields one entry.
+        let eth = "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let text = format!("{eth} ... {eth}");
+        assert_eq!(extract_contract_addresses(&text), vec![eth]);
+    }
 
     #[test]
     fn image_filename_detection() {

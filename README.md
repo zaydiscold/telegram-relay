@@ -14,8 +14,19 @@
 </p>
 
 <p align="center">
-  <a href="#what-it-does">what it does</a> · <a href="#features">features</a> · <a href="#security">security</a> · <a href="#quickstart">quickstart</a> · <a href="#config">config</a>
+  <a href="#what-it-does">what it does</a> · <a href="#features">features</a> · <a href="#security">security</a> · <a href="#install">install</a> · <a href="#quickstart">quickstart</a> · <a href="#config">config</a>
 </p>
+
+<br>
+
+<blockquote>
+<strong>heads up — this is a userbot.</strong> it signs in as your real telegram
+account over MTProto (your <code>api_id</code>/<code>api_hash</code> + phone login), not the bot api.
+that's the whole point (a bot can't see what your account sees), but automating a
+personal account is against telegram's ToS and <em>can</em> get it limited or banned. run it
+on an account you're willing to risk. if you only forward channels or groups you
+admin, the official <a href="https://core.telegram.org/bots">bot api</a> is the ToS-clean route — use that instead.
+</blockquote>
 
 <br>
 <br>
@@ -78,7 +89,9 @@ and discord's message snowflake (never the relay host's clock).
 logs in as your account, so it's careful with that reach:
 
 - only chats you route are ever touched. anything else is dropped before a byte is downloaded.
-- media streams through memory, never hits disk, never runs. `mode: placeholder` downloads nothing.
+- media streams through memory, never hits disk, is never executed. `mode: placeholder` downloads nothing.
+- egress is one-way, to *your* webhooks only — nothing phones home to anyone, no cloud, fully self-hosted.
+- treat each discord webhook url as a secret: it's an unauthenticated "post to this channel" capability. keep it in `.env`.
 - the session file is your account: `chmod 600`, never committed, revoke from telegram settings.
 - webhook tokens never appear in any log, error, or notice (enforced by the type system).
 - hardened systemd unit (`ProtectSystem=strict`, `PrivateTmp`, `NoNewPrivileges`), no phone-home.
@@ -92,6 +105,22 @@ logs in as your account, so it's careful with that reach:
 
 <br>
 <br>
+
+## install
+
+needs a rust toolchain ([rustup.rs](https://rustup.rs)).
+
+```bash
+git clone https://github.com/zaydiscold/telegram-relay
+cd telegram-relay
+cargo build --release          # binary at target/release/telegram-relay
+```
+
+or put it on your PATH so `telegram-relay` just works:
+
+```bash
+cargo install --path .
+```
 
 ## quickstart
 
@@ -151,18 +180,22 @@ per instance), not a hosted service (no dashboard, no cloud), not a bot integrat
 | key | meaning |
 |---|---|
 | `routes[].name` | label for the route (used in logs). |
+| `routes[].label` | optional friendly source name for the `routes` diagram (e.g. `News`); falls back to the `@handle`. |
 | `routes[].from` | source chat: `"@username"` or a numeric chat id. |
 | `routes[].to` | webhook names (from `webhooks:`) to fan out to. |
 | `routes[].color` | optional `"#RRGGBB"` stripe for regular posts; defaults `#9b7dff`. edited/deleted colors override it. |
 | `routes[].mode` | optional `reupload` / `placeholder`; overrides the global `media.mode`. |
 | `routes[].filter` | optional `any_keywords` / `exclude_hashtags`. |
 | `webhooks.<name>.env` | env var holding that webhook's url. |
+| `webhooks.<name>.label` | optional friendly destination name for the diagram (e.g. `"lock-in #news"`); falls back to the webhook key. |
 | `ops_webhook.env` | optional webhook for error/failure notices only. |
+| `contract_passthrough` | `true` also posts any Solana/ETH contract address as plain content outside the embed (for scanning bots). default `false`. |
 | `media.mode` | `reupload` (download and inline) or `placeholder` (link only). |
 | `media.max_bytes` | above this, fall back to a link instead of re-uploading. |
 | `refresh.interval_mins` | edit/delete re-check cadence (default 30). |
 | `refresh.horizon_hours` | stop tracking posts older than this (default 48). |
 | `refresh.reaction_horizon_mins` | stop refreshing reactions after this (default 60). |
+| `refresh.reaction_early_check_secs` | early reaction re-check, in seconds (default 60). |
 | `store.path` | sqlite file tracking relayed posts (default `relay.db`). |
 
 all three routing shapes work with no code. they're just how you write `routes`:
@@ -177,7 +210,22 @@ all three routing shapes work with no code. they're just how you write `routes`:
 - { name: split, from: "@alpha", to: [chan_a, chan_b] }
 ```
 
-`telegram-relay routes` prints the wiring and flags every fan-in and fan-out.
+`telegram-relay routes` draws the wiring both ways, so fan-in and fan-out are unambiguous:
+
+```
+telegram-relay — routing (2 source(s) → 3 destination(s))
+
+by source — where each telegram channel goes:
+  Alpha (@alpha_news)  ──▶  server · #crypto · hub
+  Beta (@beta_wire)    ──▶  server · #news · hub
+
+by destination — what each discord channel receives:
+  hub              ◀──  Alpha · Beta   (all sources)
+  server · #crypto  ◀──  Alpha
+  server · #news    ◀──  Beta
+```
+
+the friendly names come from the optional `label:` keys; without them you get bare `@handles`.
 
 <br>
 <br>

@@ -114,7 +114,7 @@ async fn post_embed_captures_message_id() {
     .await;
     let d = Deliverer::new();
     let embeds = serde_json::json!([{ "description": "hi" }]);
-    let out = d.post_embed(&WebhookUrl(url), "Rob", &embeds).await;
+    let out = d.post_embed(&WebhookUrl(url), "News", &embeds, None).await;
     match out {
         PostResult::Delivered { discord_msg_id, .. } => {
             assert_eq!(discord_msg_id, "998877665544332211");
@@ -124,7 +124,7 @@ async fn post_embed_captures_message_id() {
     let bodies = hits.0.lock().unwrap();
     assert_eq!(bodies.len(), 1);
     assert!(bodies[0].contains("\"embeds\""));
-    assert!(bodies[0].contains("\"username\":\"Rob\""));
+    assert!(bodies[0].contains("\"username\":\"News\""));
 }
 
 #[tokio::test]
@@ -170,7 +170,7 @@ async fn post_media_embed_uploads_files_with_embed_and_suppresses_mentions() {
         ("photo_2.jpg".to_string(), b"BBBBB".to_vec()),
     ];
     let out = d
-        .post_media_embed(&WebhookUrl(url), "Rob", &embeds, files)
+        .post_media_embed(&WebhookUrl(url), "News", &embeds, files, None)
         .await;
     match out {
         PostResult::Delivered { discord_msg_id, .. } => assert_eq!(discord_msg_id, "424242"),

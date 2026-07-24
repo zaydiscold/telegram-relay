@@ -689,6 +689,7 @@ async fn backfill(
                     &files,
                     false, // backfill downloads only non-oversized files
                     &media_targets,
+                    None, // no contract passthrough on catch-up (would re-trigger bots)
                 )
                 .await;
                 posted += p;
@@ -761,7 +762,7 @@ async fn backfill(
                 }
             }
 
-            match deliverer.post_embed(url, &username, &embeds).await {
+            match deliverer.post_embed(url, &username, &embeds, None).await {
                 PostResult::Delivered { discord_msg_id, .. } => {
                     let record = NewRecord {
                         chat_id: resolved.chat.0,
@@ -1018,6 +1019,8 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
     let (media_tx, mut media_rx) = mpsc::channel::<MediaItem>(MEDIA_CHANNEL_CAP);
     // Bounds concurrent media downloads so a burst can't OOM the host.
     let download_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
+    // Captured once: toggling contract_passthrough takes effect on restart.
+    let contract_passthrough = cfg.contract_passthrough;
 
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1065,7 +1068,7 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
                         probe_failures = 0;
                         handle_update(
                             u, &conn.client, &live, &deliverer, &ops, &store,
-                            &mut dedup, &media_tx, &download_sem,
+                            &mut dedup, &media_tx, &download_sem, contract_passthrough,
                         ).await;
                     }
                     // Back off briefly so a repeated stream error can't hot-spin
@@ -1114,7 +1117,9 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
                     let d = deliverer.clone();
                     let ops = ops.clone();
                     let store = store.clone();
-                    tokio::spawn(async move { flush_album(&d, &ops, &store, batch).await; });
+                    tokio::spawn(async move {
+                        flush_album(&d, &ops, &store, batch, contract_passthrough).await;
+                    });
                 }
             }
 
@@ -1123,7 +1128,9 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
                     let d = deliverer.clone();
                     let ops = ops.clone();
                     let store = store.clone();
-                    tokio::spawn(async move { flush_album(&d, &ops, &store, batch).await; });
+                    tokio::spawn(async move {
+                        flush_album(&d, &ops, &store, batch, contract_passthrough).await;
+                    });
                 }
             }
 
@@ -1148,7 +1155,7 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
     // Force-flush any albums still inside their quiet window so they are
     // delivered rather than dropped on shutdown.
     for batch in album.flush_all() {
-        flush_album(&deliverer, &ops, &store, batch).await;
+        flush_album(&deliverer, &ops, &store, batch, contract_passthrough).await;
     }
 
     let _ = updates.sync_update_state().await;
@@ -1202,6 +1209,7 @@ async fn handle_update(
     dedup: &mut Dedup,
     media_tx: &mpsc::Sender<MediaItem>,
     download_sem: &Arc<tokio::sync::Semaphore>,
+    contract_passthrough: bool,
 ) {
     let Some(incoming) = telegram::classify(update) else {
         return;
@@ -1232,6 +1240,11 @@ async fn handle_update(
             date,
             ..
         } => {
+            // Contract addresses echoed as plain content outside the embed so
+            // scanning bots (e.g. Rickbot) can act on them. Computed once per msg.
+            let content = contract_passthrough
+                .then(|| render::contract_content(&body))
+                .flatten();
             // Dedup destinations across routes: if two routes on this chat list
             // the same webhook, the text posts there ONCE. Without this the PK
             // (chat, msg, discord_id) admits two rows and the refresh worker
@@ -1288,6 +1301,7 @@ async fn handle_update(
                         username.clone(),
                         embeds.clone(),
                         date.clone(),
+                        content.clone(),
                     );
                 }
             }
@@ -1425,6 +1439,7 @@ fn spawn_embed(
     username: String,
     embeds: serde_json::Value,
     telegram_date: String,
+    content: Option<String>,
 ) {
     tokio::spawn(async move {
         // Durable dedup: the in-memory LRU is empty after a restart, and
@@ -1446,7 +1461,10 @@ fn spawn_embed(
             Err(e) => warn!(error = %e, "dedup store check failed; posting anyway"),
         }
 
-        match deliverer.post_embed(&url, &username, &embeds).await {
+        match deliverer
+            .post_embed(&url, &username, &embeds, content.as_deref())
+            .await
+        {
             PostResult::Delivered { discord_msg_id, .. } => {
                 // Live relay: measure true end-to-end latency from the two
                 // authoritative clocks (Discord snowflake vs Telegram date).
@@ -1483,9 +1501,21 @@ fn spawn_embed(
 /// `msg_id` (each physical photo uploaded once) and targets are the deduped
 /// union across all items (every webhook any matching route selected gets the
 /// album exactly once, instead of everything going to the first item's targets).
-async fn flush_album(deliverer: &Deliverer, ops: &Ops, store: &Store, batch: Vec<MediaItem>) {
+async fn flush_album(
+    deliverer: &Deliverer,
+    ops: &Ops,
+    store: &Store,
+    batch: Vec<MediaItem>,
+    contract_passthrough: bool,
+) {
     let Some(album) = coalesce_album(batch) else {
         return;
+    };
+    // Contract addresses in the caption, echoed as plain content so bots trigger.
+    let content = if contract_passthrough {
+        render::contract_content(&album.caption)
+    } else {
+        None
     };
     // Live posts have no reactions/comments yet; the refresh worker fills them.
     deliver_coalesced_media(
@@ -1504,6 +1534,7 @@ async fn flush_album(deliverer: &Deliverer, ops: &Ops, store: &Store, batch: Vec
         &album.files,
         album.any_oversized,
         &album.targets,
+        content.as_deref(),
     )
     .await;
 }
@@ -1666,6 +1697,7 @@ async fn deliver_coalesced_media(
     files: &[(String, Vec<u8>)],
     any_oversized: bool,
     targets: &[MediaTarget],
+    content: Option<&str>,
 ) -> (usize, usize, usize) {
     // Hash the RAW caption: the refresh worker recomputes the hash from the
     // anchor message's text alone, so this matches and avoids a spurious edit.
@@ -1745,10 +1777,12 @@ async fn deliver_coalesced_media(
         let username = display_name(sender, &t.route);
         let result = if deliver_files {
             deliverer
-                .post_media_embed(&t.url, &username, &embeds, files.to_vec())
+                .post_media_embed(&t.url, &username, &embeds, files.to_vec(), content)
                 .await
         } else {
-            deliverer.post_embed(&t.url, &username, &embeds).await
+            deliverer
+                .post_embed(&t.url, &username, &embeds, content)
+                .await
         };
         match result {
             PostResult::Delivered {
